@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from pyannote.core.utils.generators import pairwise
+from rich.console import Console
 
 from pyannote.audio.core.model import Model
 from pyannote.audio.core.task import Task
@@ -37,6 +38,8 @@ from pyannote.audio.utils.receptive_field import (
     conv1d_receptive_field_center,
     conv1d_receptive_field_size,
 )
+
+console = Console()
 
 
 class SSeRiouSS(Model):
@@ -88,6 +91,7 @@ class SSeRiouSS(Model):
         num_channels: int = 1,
         task: Optional[Task] = None,
     ):
+
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
 
         if isinstance(wav2vec, str):
@@ -149,9 +153,12 @@ class SSeRiouSS(Model):
             self.lstm = nn.ModuleList(
                 [
                     nn.LSTM(
-                        wav2vec_dim
-                        if i == 0
-                        else lstm["hidden_size"] * (2 if lstm["bidirectional"] else 1),
+                        (
+                            wav2vec_dim
+                            if i == 0
+                            else lstm["hidden_size"]
+                            * (2 if lstm["bidirectional"] else 1)
+                        ),
                         **one_layer_lstm,
                     )
                     for i in range(num_layers)
@@ -215,15 +222,25 @@ class SSeRiouSS(Model):
         """
 
         num_frames = num_samples
-        for conv_layer in self.wav2vec.feature_extractor.conv_layers:
-            num_frames = conv1d_num_frames(
-                num_frames,
-                kernel_size=conv_layer.kernel_size,
-                stride=conv_layer.stride,
-                padding=conv_layer.conv.padding[0],
-                dilation=conv_layer.conv.dilation[0],
-            )
-
+        try:
+            for conv_layer in self.wav2vec.feature_extractor.conv_layers:
+                num_frames = conv1d_num_frames(
+                    num_frames,
+                    kernel_size=conv_layer.kernel_size,
+                    stride=conv_layer.stride,
+                    padding=conv_layer.conv.padding[0],
+                    dilation=conv_layer.conv.dilation[0],
+                )
+        except AttributeError:
+            # wav2vec does not contains feature_extractor
+            for conv_layer in self.wav2vec.model.feature_extractor.conv_layers:
+                num_frames = conv1d_num_frames(
+                    num_frames,
+                    kernel_size=conv_layer.kernel_size,
+                    stride=conv_layer.stride,
+                    padding=conv_layer.conv.padding[0],
+                    dilation=conv_layer.conv.dilation[0],
+                )
         return num_frames
 
     def receptive_field_size(self, num_frames: int = 1) -> int:
@@ -239,15 +256,26 @@ class SSeRiouSS(Model):
         receptive_field_size : int
             Receptive field size.
         """
-
-        receptive_field_size = num_frames
-        for conv_layer in reversed(self.wav2vec.feature_extractor.conv_layers):
-            receptive_field_size = conv1d_receptive_field_size(
-                num_frames=receptive_field_size,
-                kernel_size=conv_layer.kernel_size,
-                stride=conv_layer.stride,
-                dilation=conv_layer.conv.dilation[0],
-            )
+        try:
+            receptive_field_size = num_frames
+            for conv_layer in reversed(self.wav2vec.feature_extractor.conv_layers):
+                receptive_field_size = conv1d_receptive_field_size(
+                    num_frames=receptive_field_size,
+                    kernel_size=conv_layer.kernel_size,
+                    stride=conv_layer.stride,
+                    dilation=conv_layer.conv.dilation[0],
+                )
+        except AttributeError:
+            # wav2vec does not contains feature_extractor
+            for conv_layer in reversed(
+                self.wav2vec.model.feature_extractor.conv_layers
+            ):
+                receptive_field_size = conv1d_receptive_field_size(
+                    num_frames=receptive_field_size,
+                    kernel_size=conv_layer.kernel_size,
+                    stride=conv_layer.stride,
+                    dilation=conv_layer.conv.dilation[0],
+                )
         return receptive_field_size
 
     def receptive_field_center(self, frame: int = 0) -> int:
@@ -264,14 +292,27 @@ class SSeRiouSS(Model):
             Index of receptive field center.
         """
         receptive_field_center = frame
-        for conv_layer in reversed(self.wav2vec.feature_extractor.conv_layers):
-            receptive_field_center = conv1d_receptive_field_center(
-                receptive_field_center,
-                kernel_size=conv_layer.kernel_size,
-                stride=conv_layer.stride,
-                padding=conv_layer.conv.padding[0],
-                dilation=conv_layer.conv.dilation[0],
-            )
+        try:
+            for conv_layer in reversed(self.wav2vec.feature_extractor.conv_layers):
+                receptive_field_center = conv1d_receptive_field_center(
+                    receptive_field_center,
+                    kernel_size=conv_layer.kernel_size,
+                    stride=conv_layer.stride,
+                    padding=conv_layer.conv.padding[0],
+                    dilation=conv_layer.conv.dilation[0],
+                )
+        except AttributeError:
+            # wav2vec does not contains feature_extractor
+            for conv_layer in reversed(
+                self.wav2vec.model.feature_extractor.conv_layers
+            ):
+                receptive_field_center = conv1d_receptive_field_center(
+                    receptive_field_center,
+                    kernel_size=conv_layer.kernel_size,
+                    stride=conv_layer.stride,
+                    padding=conv_layer.conv.padding[0],
+                    dilation=conv_layer.conv.dilation[0],
+                )
         return receptive_field_center
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
@@ -313,5 +354,4 @@ class SSeRiouSS(Model):
         if self.hparams.linear["num_layers"] > 0:
             for linear in self.linear:
                 outputs = F.leaky_relu(linear(outputs))
-
         return self.activation(self.classifier(outputs))
