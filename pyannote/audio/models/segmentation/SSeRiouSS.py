@@ -123,6 +123,10 @@ class SSeRiouSS(Model):
             wav2vec_dim = wav2vec["encoder_embed_dim"]
             wav2vec_num_layers = wav2vec["encoder_num_layers"]
 
+        # Wav2vec should be freeze there for an accurate parameter counting
+        for param in self.wav2vec.parameters():
+            param.requires_grad = False
+
         if wav2vec_layer < 0:
             self.wav2vec_weights = nn.Parameter(
                 data=torch.ones(wav2vec_num_layers), requires_grad=True
@@ -266,6 +270,7 @@ class SSeRiouSS(Model):
                     dilation=conv_layer.conv.dilation[0],
                 )
         except AttributeError:
+            # print("marche")
             # wav2vec does not contains feature_extractor
             for conv_layer in reversed(
                 self.wav2vec.model.feature_extractor.conv_layers

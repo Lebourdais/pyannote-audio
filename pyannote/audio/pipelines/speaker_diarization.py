@@ -132,9 +132,13 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         self.segmentation_step = segmentation_step
 
         self.embedding = embedding
+        self.total_parameters = sum(param.numel() for param in model.parameters())
+
+        self.trainable_parameters = sum(
+            p.numel() for p in model.parameters() if p.requires_grad
+        )
         self.embedding_batch_size = embedding_batch_size
         self.embedding_exclude_overlap = embedding_exclude_overlap
-
         self.klustering = clustering
 
         self.der_variant = der_variant or {"collar": 0.0, "skip_overlap": False}
@@ -176,6 +180,13 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
                 f'clustering must be one of [{", ".join(list(Clustering.__members__))}]'
             )
         self.clustering = Klustering.value(metric=metric)
+
+    @property
+    def number_parameters(self) -> dict:
+        return {
+            "total_parameters": self.total_parameters,
+            "trainable_parameters": self.trainable_parameters,
+        }
 
     @property
     def segmentation_batch_size(self) -> int:
@@ -519,7 +530,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
             hook("embeddings", embeddings)
             #   shape: (num_chunks, local_num_speakers, dimension)
 
-        hard_clusters, _, centroids = self.clustering(
+        hard_clusters, soft_clusters, centroids = self.clustering(
             embeddings=embeddings,
             segmentations=binarized_segmentations,
             num_clusters=num_speakers,
@@ -564,11 +575,13 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         #   shape: (num_chunks, num_speakers)
 
         hard_clusters[inactive_speakers] = -2
+
         discrete_diarization = self.reconstruct(
             segmentations,
             hard_clusters,
             count,
         )
+
         hook("discrete_diarization", discrete_diarization)
 
         # convert to continuous diarization

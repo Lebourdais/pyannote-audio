@@ -624,7 +624,7 @@ class Model(pl.LightningModule):
                     # etag_timeout=10,
                     # resume_download=False,
                     use_auth_token=use_auth_token,
-                    # local_files_only=False,
+                    local_files_only=True,
                     # legacy_cache_layout=False,
                 )
             except RepositoryNotFoundError:
@@ -661,7 +661,7 @@ visit https://hf.co/{model_id} to accept the user conditions."""
                     # etag_timeout=10,
                     # resume_download=False,
                     use_auth_token=use_auth_token,
-                    # local_files_only=False,
+                    local_files_only=True,
                     # legacy_cache_layout=False,
                 )
 
