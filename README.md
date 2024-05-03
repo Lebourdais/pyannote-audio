@@ -71,13 +71,15 @@ for turn, _, speaker in diarization.itertracks(yield_label=True):
   - [Introduction to speaker diarization](https://umotion.univ-lemans.fr/video/9513-speech-segmentation-and-speaker-diarization/) / JSALT 2023 summer school / 90 min
   - [Speaker segmentation model](https://www.youtube.com/watch?v=wDH2rvkjymY) / Interspeech 2021 / 3 min
   - [First release of pyannote.audio](https://www.youtube.com/watch?v=37R_R82lfwA) / ICASSP 2020 / 8 min
+- Community contributions (not maintained by the core team)
+  - 2024-04-05 > [Offline speaker diarization (speaker-diarization-3.1)](tutorials/community/offline_usage_speaker_diarization.ipynb) by [Simon Ottenhaus](https://github.com/simonottenhauskenbun)
 
 ## Benchmark
 
 Out of the box, `pyannote.audio` speaker diarization [pipeline](https://hf.co/pyannote/speaker-diarization-3.1) v3.1 is expected to be much better (and faster) than v2.x.
 Those numbers are diarization error rates (in %):
 
-| Benchmark              | [v2.1](https://hf.co/pyannote/speaker-diarization-2.1) | [v3.1](https://hf.co/pyannote/speaker-diarization-3.1) | [Premium](https://forms.gle/eKhn7H2zTa68sMMx8) |
+| Benchmark              | [v2.1](https://hf.co/pyannote/speaker-diarization-2.1) | [v3.1](https://hf.co/pyannote/speaker-diarization-3.1) | [Premium](https://forms.office.com/e/GdqwVgkZ5C) |
 | ---------------------- | ------ | ------ | --------- |
 | [AISHELL-4](https://arxiv.org/abs/2104.03603)              |  14.1  |  12.2  | 11.9      |
 | [AliMeeting](https://www.openslr.org/119/) (channel 1) |  27.4  |  24.4  | 22.5      |
