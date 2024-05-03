@@ -20,23 +20,56 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from functools import lru_cache
+import math
+from functools import lru_cache, partial
 from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
-from pyannote.core.utils.generators import pairwise
+from mamba_ssm import Mamba
 
 from pyannote.audio.core.model import Model
 from pyannote.audio.core.task import Task
 from pyannote.audio.models.blocks.sincnet import SincNet
-from pyannote.audio.models.blocks.tcn import TCN
 from pyannote.audio.utils.params import merge_dict
 
+from .RMSNorm import RMSNorm
 
-class PyanNet(Model):
+
+def _init_weights(
+    module,
+    n_layer,
+    initializer_range=0.02,  # Now only used for embedding layer.
+    rescale_prenorm_residual=True,
+    n_residuals_per_layer=1,  # Change to 2 if we have MLP
+):
+    if isinstance(module, nn.Linear):
+        if module.bias is not None:
+            if not getattr(module.bias, "_no_reinit", False):
+                nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, std=initializer_range)
+
+    if rescale_prenorm_residual:
+        # Reinitialize selected weights subject to the OpenAI GPT-2 Paper Scheme:
+        #   > A modified initialization which accounts for the accumulation on the residual path with model depth. Scale
+        #   > the weights of residual layers at initialization by a factor of 1/√N where N is the # of residual layers.
+        #   >   -- GPT-2 :: https://openai.com/blog/better-language-models/
+        #
+        # Reference (Megatron-LM): https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/model/gpt_model.py
+        for name, p in module.named_parameters():
+            if name in ["out_proj.weight", "fc2.weight"]:
+                # Special Scaled Initialization --> There are 2 Layer Norms per Transformer Block
+                # Following Pytorch init, except scale by 1/sqrt(2 * n_layer)
+                # We need to reinit p since this code could be called multiple times
+                # Having just p *= scale would repeatedly scale it down
+                nn.init.kaiming_uniform_(p, a=math.sqrt(5))
+                with torch.no_grad():
+                    p /= math.sqrt(n_residuals_per_layer * n_layer)
+
+
+class MambaNet(Model):
     """PyanNet segmentation model
 
     SincNet > LSTM > Feed forward > Classifier
@@ -63,147 +96,62 @@ class PyanNet(Model):
     """
 
     SINCNET_DEFAULTS = {"stride": 10}
-    LSTM_DEFAULTS = {
-        "hidden_size": 128,
-        "num_layers": 2,
-        "bidirectional": True,
-        "monolithic": True,
-        "dropout": 0.0,
-    }
-    TCN_DEFAULTS = {
-        "in_chan": 60,
-        "n_src": 1,
-        "out_chan": 1,
-        "n_blocks": 3,
-        "n_repeats": 5,
-        "bn_chan": 128,
-        "hid_chan": 512,
-        "kernel_size": 3,
-        "norm_type": "gLN",
-        "representation": False,
-        # "dropout": 0.0,
+    MAMBA_DEFAULTS = {
+        "d_model": 60,
+        "d_state": 16,
+        "d_conv": 4,
+        "expand": 2,
     }
     LINEAR_DEFAULTS = {"hidden_size": 128, "num_layers": 2}
 
     def __init__(
         self,
         sincnet: Optional[dict] = None,
-        lstm: Optional[dict] = None,
+        mamba: Optional[dict] = None,
+        num_block=3,
+        num_repeat=5,
         linear: Optional[dict] = None,
-        tcn: Optional[dict] = None,
-        sample_rate: int = 16000,
-        num_channels: int = 1,
+        sample_rate=16000,
+        num_channels=1,
         task: Optional[Task] = None,
-        use_tcn: bool = False,
     ):
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
-        self.use_tcn = use_tcn
         sincnet = merge_dict(self.SINCNET_DEFAULTS, sincnet)
         sincnet["sample_rate"] = sample_rate
-
+        mamba = merge_dict(self.MAMBA_DEFAULTS, mamba)
         linear = merge_dict(self.LINEAR_DEFAULTS, linear)
-
-        if not use_tcn:
-
-            lstm = merge_dict(self.LSTM_DEFAULTS, lstm)
-            lstm["batch_first"] = True
-            self.save_hyperparameters("sincnet", "lstm", "linear")
-        else:
-
-            tcn = merge_dict(self.TCN_DEFAULTS, tcn)
-            self.save_hyperparameters("sincnet", "tcn", "linear")
-
+        self.save_hyperparameters("sincnet", "mamba", "linear")
+        self.norm = RMSNorm(d=mamba["d_model"], eps=1e-5)
         self.sincnet = SincNet(**self.hparams.sincnet)
-
-        if not use_tcn:
-            monolithic = lstm["monolithic"]
-            if monolithic:
-                multi_layer_lstm = dict(lstm)
-                del multi_layer_lstm["monolithic"]
-                self.lstm = nn.LSTM(60, **multi_layer_lstm)
-
-            else:
-                num_layers = lstm["num_layers"]
-                if num_layers > 1:
-                    self.dropout = nn.Dropout(p=lstm["dropout"])
-
-                one_layer_lstm = dict(lstm)
-                one_layer_lstm["num_layers"] = 1
-                one_layer_lstm["dropout"] = 0.0
-                del one_layer_lstm["monolithic"]
-
-                self.lstm = nn.ModuleList(
-                    [
-                        nn.LSTM(
-                            (
-                                60
-                                if i == 0
-                                else lstm["hidden_size"]
-                                * (2 if lstm["bidirectional"] else 1)
-                            ),
-                            **one_layer_lstm,
-                        )
-                        for i in range(num_layers)
-                    ]
-                )
-        else:
-            print("No need to load LSTM")
-            pass
-
-        if linear["num_layers"] < 1:
-            return
-        if not use_tcn:
-            out_features: int = self.hparams.lstm["hidden_size"] * (
-                2 if self.hparams.lstm["bidirectional"] else 1
+        modules = []
+        for _ in range(num_repeat):
+            modules_block = []
+            for _ in range(num_block):
+                modules_block.append(Mamba(**self.hparams.mamba))
+                modules_block.append(self.norm)
+            modules.append(nn.Sequential(*modules_block))
+        self.mamba = nn.ModuleList(modules)
+        self.apply(
+            partial(
+                _init_weights,
+                n_layer=num_block * num_repeat,
             )
-        else:
-            out_features = tcn["out_chan"]
-
-        self.linear = nn.ModuleList(
-            [
-                nn.Linear(in_features, out_features)
-                for in_features, out_features in pairwise(
-                    [
-                        out_features,
-                    ]
-                    + [self.hparams.linear["hidden_size"]]
-                    * self.hparams.linear["num_layers"]
-                )
-            ]
         )
 
     @property
     def dimension(self) -> int:
         """Dimension of output"""
-
         if isinstance(self.specifications, tuple):
             raise ValueError("PyanNet does not support multi-tasking.")
 
         if self.specifications.powerset:
-
             return self.specifications.num_powerset_classes
         else:
             return len(self.specifications.classes)
 
     def build(self):
 
-        if self.hparams.linear["num_layers"] > 0:
-            in_features = self.hparams.linear["hidden_size"]
-        else:
-            if not self.use_tcn:
-                in_features = self.hparams.lstm["hidden_size"] * (
-                    2 if self.hparams.lstm["bidirectional"] else 1
-                )
-                self.classifier = nn.Linear(in_features, self.dimension)
-            else:
-                in_features = 0
-
-        if self.use_tcn:
-
-            self.hparams.tcn["out_chan"] = self.dimension
-            # self.dropout = nn.Dropout(p=self.hparams.tcn["dropout"])
-            self.classifier = TCN(**self.hparams.tcn)
-
+        self.classifier = nn.Linear(60, self.dimension)
         self.activation = self.default_activation()
 
     @lru_cache
@@ -266,30 +214,9 @@ class PyanNet(Model):
         scores : (batch, frame, classes)
         """
 
-        outputs = self.sincnet(waveforms)
-
-        if not self.use_tcn:
-            if self.hparams.lstm["monolithic"]:
-                outputs, _ = self.lstm(
-                    rearrange(outputs, "batch feature frame -> batch frame feature")
-                )
-            else:
-                outputs = rearrange(
-                    outputs, "batch feature frame -> batch frame feature"
-                )
-                for i, lstm in enumerate(self.lstm):
-                    outputs, _ = lstm(outputs)
-                    if i + 1 < self.hparams.lstm["num_layers"]:
-                        outputs = self.dropout(outputs)
-        else:
-
-            outputs = self.classifier(outputs)
-
-        if self.hparams.linear["num_layers"] > 0:
-            for linear in self.linear:
-                outputs = F.leaky_relu(linear(outputs))
-            out = self.classifier(outputs)
-        else:
-
-            out = rearrange(outputs, "batch classes frame -> batch frame classes")
-        return self.activation(out)
+        outputs = rearrange(self.sincnet(waveforms), "b d t -> b t d")
+        for block in self.mamba:
+            residual = outputs
+            outputs = self.norm(block(outputs))
+            outputs += residual
+        return self.activation(self.classifier(outputs))

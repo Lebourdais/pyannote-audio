@@ -24,4 +24,6 @@ from .PyanNet import PyanNet
 from .SSeRiouSS import SSeRiouSS
 from .ToTaToNet import ToTaToNet
 
+# from .ToTaToNet_dup import ToTaToNet
+
 __all__ = ["PyanNet", "SSeRiouSS", "ToTaToNet"]

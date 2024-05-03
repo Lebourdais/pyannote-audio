@@ -126,6 +126,7 @@ class SegmentationTask(Task):
             file_id = file_ids[cum_prob_annotated_duration.searchsorted(rng.random())]
 
             # generate `num_chunks_per_file` chunks from this file
+            segs_to_send = []
             for _ in range(num_chunks_per_file):
                 # find indices of annotated regions in this file
                 annotated_region_indices = np.where(
@@ -155,8 +156,16 @@ class SegmentationTask(Task):
                     annotated_region_index
                 ]
                 start_time = rng.uniform(start, start + region_duration - duration)
-
-                yield self.prepare_chunk(file_id, start_time, duration)
+                segs_to_send.append(
+                    {"file_id": file_id, "start_time": start_time, "duration": duration}
+                )
+            if (
+                len(segs_to_send) % num_chunks_per_file == 0
+            ):  # If multiple segments per chunk, don't want to send a half chunk
+                for seg in segs_to_send:
+                    yield self.prepare_chunk(
+                        seg["file_id"], seg["start_time"], seg["duration"]
+                    )
 
     def train__iter__(self):
         """Iterate over training samples

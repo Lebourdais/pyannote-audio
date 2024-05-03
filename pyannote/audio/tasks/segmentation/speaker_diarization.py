@@ -152,6 +152,7 @@ class SpeakerDiarization(SegmentationTask):
             int
         ] = None,  # deprecated in favor of `max_speakers_per_chunk``
         loss: Literal["bce", "mse"] = None,  # deprecated
+        double: bool = False,
     ):
         super().__init__(
             protocol,
@@ -164,7 +165,7 @@ class SpeakerDiarization(SegmentationTask):
             metric=metric,
             cache=cache,
         )
-
+        self.double = double
         if not isinstance(protocol, SpeakerDiarizationProtocol):
             raise ValueError(
                 "SpeakerDiarization task requires a SpeakerDiarizationProtocol."
@@ -197,9 +198,16 @@ class SpeakerDiarization(SegmentationTask):
         self.weight = weight
         self.vad_loss = vad_loss
 
+    def train__len__(self):
+        if self.double:
+            return 2 * super().train__len__()
+
+        else:
+            return super().train__len__()
+
     def setup(self, stage=None):
         super().setup(stage)
-
+        print("Setup")
         # estimate maximum number of speakers per chunk when not provided
         if self.max_speakers_per_chunk is None:
             training = self.prepared_data["audio-metadata"]["subset"] == Subsets.index(
@@ -284,13 +292,15 @@ class SpeakerDiarization(SegmentationTask):
                 f"`max_speakers_per_frame` ({self.max_speakers_per_frame}) must be smaller "
                 f"than `max_speakers_per_chunk` ({self.max_speakers_per_chunk})"
             )
-
+        print("defining specifications")
         # now that we know about the number of speakers upper bound
         # we can set task specifications
         self.specifications = Specifications(
-            problem=Problem.MULTI_LABEL_CLASSIFICATION
-            if self.max_speakers_per_frame is None
-            else Problem.MONO_LABEL_CLASSIFICATION,
+            problem=(
+                Problem.MULTI_LABEL_CLASSIFICATION
+                if self.max_speakers_per_frame is None
+                else Problem.MONO_LABEL_CLASSIFICATION
+            ),
             resolution=Resolution.FRAME,
             duration=self.duration,
             min_duration=self.min_duration,
@@ -299,6 +309,7 @@ class SpeakerDiarization(SegmentationTask):
             powerset_max_classes=self.max_speakers_per_frame,
             permutation_invariant=True,
         )
+        print(self.specifications)
 
     def setup_loss_func(self):
         if self.specifications.powerset:
@@ -333,7 +344,6 @@ class SpeakerDiarization(SegmentationTask):
         """
 
         file = self.get_file(file_id)
-
         # get label scope
         label_scope = Scopes[self.prepared_data["audio-metadata"][file_id]["scope"]]
         label_scope_key = f"{label_scope}_label_idx"
@@ -538,6 +548,7 @@ class SpeakerDiarization(SegmentationTask):
 
         # target
         target = batch["y"]
+
         # (batch_size, num_frames, num_speakers)
 
         waveform = batch["X"]
@@ -546,6 +557,11 @@ class SpeakerDiarization(SegmentationTask):
         # drop samples that contain too many speakers
         num_speakers: torch.Tensor = torch.sum(torch.any(target, dim=1), dim=1)
         keep: torch.Tensor = num_speakers <= self.max_speakers_per_chunk
+        # arbitrary mask sample (artifact created by concatenation)
+        # Any -1 in the target ignore the sample for the forward
+        mask = torch.all(target != -1)
+        keep = mask & keep
+
         target = target[keep]
         waveform = waveform[keep]
 

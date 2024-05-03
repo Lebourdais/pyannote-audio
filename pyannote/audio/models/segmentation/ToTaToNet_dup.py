@@ -26,11 +26,10 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from asteroid.masknn import DPRNN
+import torchaudio
 from asteroid.utils.torch_utils import pad_x_to_y
 from asteroid_filterbanks import make_enc_dec
 from pyannote.core.utils.generators import pairwise
-from transformers import AutoModel
 
 from pyannote.audio.core.model import Model
 from pyannote.audio.core.task import Task
@@ -40,6 +39,11 @@ from pyannote.audio.utils.receptive_field import (
     conv1d_receptive_field_center,
     conv1d_receptive_field_size,
 )
+
+# from asteroid.masknn import DPRNN
+from ..blocks.DPRNN import DPRNN
+
+# from transformers import AutoProcessor, AutoModel
 
 
 class ToTaToNet(Model):
@@ -113,10 +117,6 @@ class ToTaToNet(Model):
         "mask_act": "relu",
         "rnn_type": "LSTM",
     }
-    FEATURES_DEFAULTS = {
-        "wavlm_version": "microsoft/wavlm-large",
-        "use_wavlm": True,
-    }
     DIAR_DEFAULTS = {"frames_per_second": 125}
 
     def __init__(
@@ -127,33 +127,28 @@ class ToTaToNet(Model):
         diar: Optional[dict] = None,
         convnet: dict = None,
         dprnn: dict = None,
-        features: dict = None,
         sample_rate: int = 16000,
         num_channels: int = 1,
         task: Optional[Task] = None,
         n_sources: int = 3,
         use_lstm: bool = False,
         use_wavlm: bool = True,
-        wavlm_version="microsoft/wavlm-large",
         gradient_clip_val: float = 5.0,
     ):
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
 
         lstm = merge_dict(self.LSTM_DEFAULTS, lstm)
         lstm["batch_first"] = True
-        features = merge_dict(self.FEATURES_DEFAULTS, features)
         linear = merge_dict(self.LINEAR_DEFAULTS, linear)
         dprnn = merge_dict(self.DPRNN_DEFAULTS, dprnn)
         encoder_decoder = merge_dict(self.ENCODER_DECODER_DEFAULTS, encoder_decoder)
         diar = merge_dict(self.DIAR_DEFAULTS, diar)
         self.n_src = n_sources
         self.use_lstm = use_lstm
-        self.use_wavlm = features["use_wavlm"]
-        self.save_hyperparameters(
-            "features", "encoder_decoder", "lstm", "linear", "dprnn", "diar"
-        )
+        self.use_wavlm = use_wavlm
+        self.save_hyperparameters("encoder_decoder", "lstm", "linear", "dprnn", "diar")
         self.n_sources = n_sources
-        self.wavlm_version = features["wavlm_version"]
+
         if encoder_decoder["fb_name"] == "free":
             n_feats_out = encoder_decoder["n_filters"]
         elif encoder_decoder["fb_name"] == "stft":
@@ -163,18 +158,28 @@ class ToTaToNet(Model):
         self.encoder, self.decoder = make_enc_dec(
             sample_rate=sample_rate, **self.hparams.encoder_decoder
         )
-
+        print("ALTERNATE VERSION OF TOTATONET")
         if self.use_wavlm:
-            self.wavlm = AutoModel.from_pretrained(self.wavlm_version)
+            bundle = getattr(torchaudio.pipelines, "WAVLM_LARGE")
+            self.wavlm_dim = bundle._params["encoder_embed_dim"]
+            self.wavlm_num_layers = bundle._params["encoder_num_layers"]
+            self.wavlm = bundle.get_model()
+            self.wavlm_layer = -1
+            for param in self.wavlm.parameters():
+                param.requires_grad = False
+
+            self.wavlm_weights = nn.Parameter(
+                data=torch.ones(self.wavlm_num_layers), requires_grad=True
+            )
+            # self.wavlm = AutoModel.from_pretrained("microsoft/wavlm-large")
             downsampling_factor = 1
-            for conv_layer in self.wavlm.feature_extractor.conv_layers:
+            for conv_layer in self.wavlm.model.feature_extractor.conv_layers:
                 if isinstance(conv_layer.conv, nn.Conv1d):
                     downsampling_factor *= conv_layer.conv.stride[0]
             self.wavlm_scaling = int(downsampling_factor / encoder_decoder["stride"])
 
             self.masker = DPRNN(
-                encoder_decoder["n_filters"]
-                + self.wavlm.feature_projection.projection.out_features,
+                encoder_decoder["n_filters"] + self.wavlm_dim,
                 out_chan=encoder_decoder["n_filters"],
                 n_src=n_sources,
                 **self.hparams.dprnn
@@ -321,7 +326,20 @@ class ToTaToNet(Model):
         bsz = waveforms.shape[0]
         tf_rep = self.encoder(waveforms)
         if self.use_wavlm:
-            wavlm_rep = self.wavlm(waveforms.squeeze(1)).last_hidden_state
+            num_layers = None if self.wavlm_layer < 0 else self.wavlm_layer
+
+            with torch.no_grad():
+                outputs, _ = self.wavlm.extract_features(
+                    waveforms.squeeze(1), num_layers=num_layers
+                )
+
+            if num_layers is None:
+                outputs = torch.stack(outputs, dim=-1) @ F.softmax(
+                    self.wavlm_weights, dim=0
+                )
+            else:
+                outputs = outputs[-1]
+            wavlm_rep = outputs
             wavlm_rep = wavlm_rep.transpose(1, 2)
             wavlm_rep = wavlm_rep.repeat_interleave(self.wavlm_scaling, dim=-1)
             wavlm_rep = pad_x_to_y(wavlm_rep, tf_rep)

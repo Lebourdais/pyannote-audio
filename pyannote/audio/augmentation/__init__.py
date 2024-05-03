@@ -21,6 +21,8 @@
 # SOFTWARE.
 
 
+from .conversation_aug import ConversationGeneration
 from .mix import MixSpeakerDiarization
+from .reverb_aug import ReverbAugmentation
 
-__all__ = ["MixSpeakerDiarization"]
+__all__ = ["MixSpeakerDiarization", "ConversationGeneration", "ReverbAugmentation"]

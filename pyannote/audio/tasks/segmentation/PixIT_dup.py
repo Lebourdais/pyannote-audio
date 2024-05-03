@@ -31,7 +31,7 @@ from typing import Dict, Literal, Optional, Sequence, Text, Union
 import numpy as np
 import torch
 import torch.nn.functional
-from asteroid.losses import MixITLossWrapper, multisrc_neg_sisdr
+from asteroid.losses import multisrc_neg_sisdr
 from matplotlib import pyplot as plt
 from pyannote.core import Segment, SlidingWindowFeature
 from pyannote.database.protocol import SpeakerDiarizationProtocol
@@ -52,6 +52,7 @@ from pyannote.audio.torchmetrics import (
     OptimalSpeakerConfusionRate,
 )
 from pyannote.audio.utils.loss import binary_cross_entropy
+from pyannote.audio.utils.mixit import MixITLossWrapper
 from pyannote.audio.utils.permutation import permutate
 from pyannote.audio.utils.random import create_rng_for_worker
 
@@ -219,6 +220,7 @@ class PixIT(SegmentationTask):
         self.mixit_loss = MixITLossWrapper(multisrc_neg_sisdr, generalized=True)
         self.finetune_wavlm = finetune_wavlm
         self.accumulate_gradient = accumulate_gradient
+        print("ALTERNATE VERSION OF PIXIT")
 
     def setup(self, stage=None):
         super().setup(stage)
@@ -933,6 +935,7 @@ class PixIT(SegmentationTask):
         # (batch_size, num_frames, 1)
 
         permutated_diarization, permutations = permutate(target, diarization)
+        # P = permutations
 
         seg_loss = self.segmentation_loss(permutated_diarization, target, weight=weight)
 
@@ -963,12 +966,6 @@ class PixIT(SegmentationTask):
         loss : {str: torch.tensor}
             {"loss": loss}
         """
-        # finetuning wavlm with a smaller learning rate requires two optimizers
-        # and manual gradient stepping
-        if self.finetune_wavlm:
-            wavlm_opt, rest_opt = self.model.optimizers()
-            wavlm_opt.zero_grad()
-            rest_opt.zero_grad()
 
         (
             seg_loss,
@@ -977,6 +974,7 @@ class PixIT(SegmentationTask):
             permutated_diarization,
             target,
         ) = self.common_step(batch)
+
         self.model.log(
             "loss/train/separation",
             separation_loss,
@@ -999,6 +997,7 @@ class PixIT(SegmentationTask):
             1 - self.separation_loss_weight
         ) * seg_loss + self.separation_loss_weight * separation_loss
         loss /= self.accumulate_gradient
+
         # skip batch if something went wrong for some reason
         if torch.isnan(loss):
             return None
@@ -1011,23 +1010,6 @@ class PixIT(SegmentationTask):
             prog_bar=False,
             logger=True,
         )
-
-        if self.finetune_wavlm:
-
-            self.model.manual_backward(loss)
-            self.model.clip_gradients(
-                wavlm_opt,
-                gradient_clip_val=self.model.gradient_clip_val,
-                gradient_clip_algorithm="norm",
-            )
-            self.model.clip_gradients(
-                rest_opt,
-                gradient_clip_val=self.model.gradient_clip_val,
-                gradient_clip_algorithm="norm",
-            )
-            if (batch_idx + 1) % self.accumulate_gradient == 0:
-                wavlm_opt.step()
-                rest_opt.step()
 
         return {"loss": loss}
 

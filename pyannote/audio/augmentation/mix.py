@@ -25,7 +25,7 @@ from typing import Optional
 
 import torch
 from torch import Tensor
-from torch_audiomentations import Mix
+from torch_audiomentations.augmentations.mix import Mix
 
 
 class MixSpeakerDiarization(Mix):
