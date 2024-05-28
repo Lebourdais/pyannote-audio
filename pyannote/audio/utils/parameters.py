@@ -93,8 +93,22 @@ class Parameters:
 
         Create a parameter object reading the config file
         """
+        fix = False
         with open(yaml_path) as yaml_in:
-            cfg = yaml.safe_load(yaml_in)
+            try:
+                cfg = yaml.safe_load(yaml_in)
+            except yaml.scanner.ScannerError as e:
+                print(e)
+                yaml_str = yaml_in.read()
+                yaml_str.replace("\t", "    ")
+                print(yaml_str)
+                fix = True
+        if fix:
+            with open(yaml_path, "w") as yaml_out:
+                yaml_out.write(yaml_str)
+            with open(yaml_path) as yaml_in:
+                cfg = yaml.safe_load(yaml_in)
+
         train_params = cfg["train"]
         opti_param = cfg.get("optimize", {})
         eval_param = cfg.get("evaluate", {})

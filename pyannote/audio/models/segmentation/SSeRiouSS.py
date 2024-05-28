@@ -26,9 +26,10 @@ from typing import Optional, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torchaudio
+from peft import LoraConfig, LoraModel
 from pyannote.core.utils.generators import pairwise
 from rich.console import Console
+from transformers import AutoModel
 
 from pyannote.audio.core.model import Model
 from pyannote.audio.core.task import Task
@@ -83,66 +84,66 @@ class SSeRiouSS(Model):
 
     def __init__(
         self,
-        wav2vec: Union[dict, str] = None,
+        ssl: Union[dict, str] = None,
         wav2vec_layer: int = -1,
         lstm: Optional[dict] = None,
         linear: Optional[dict] = None,
         sample_rate: int = 16000,
         num_channels: int = 1,
         task: Optional[Task] = None,
+        finetune_wavlm=None,
+        gradient_clip_val: float = 5.0,
     ):
 
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
+        self.gradient_clip_val = gradient_clip_val
+        self.finetune_wavlm = finetune_wavlm
 
-        if isinstance(wav2vec, str):
-            # `wav2vec` is one of the supported pipelines from torchaudio (e.g. "WAVLM_BASE")
-            if hasattr(torchaudio.pipelines, wav2vec):
-                bundle = getattr(torchaudio.pipelines, wav2vec)
-                if sample_rate != bundle._sample_rate:
-                    raise ValueError(
-                        f"Expected {bundle._sample_rate}Hz, found {sample_rate}Hz."
-                    )
-                wav2vec_dim = bundle._params["encoder_embed_dim"]
-                wav2vec_num_layers = bundle._params["encoder_num_layers"]
-                self.wav2vec = bundle.get_model()
+        if isinstance(ssl, str):
+            # `ssl` is one of the pretrained model in huggingface
+            self.ssl = AutoModel.from_pretrained(ssl)
+            model_dim = self.ssl.feature_projection.projection.out_features
+            # model_num_layers = self.ssl.config.num_hidden_layers
 
-            # `wav2vec` is a path to a self-supervised representation checkpoint
+        # the ssl should be freeze there for an accurate parameter counting
+        if self.finetune_wavlm is None:
+            for param in self.ssl.parameters():
+                param.requires_grad = False
+        elif self.finetune_wavlm["type"] == "lora":
+            if self.finetune_wavlm["dual_optimizer"]:
+                self.automatic_optimization = False
+            if "adapter" in self.finetune_wavlm:
+                adapter = self.finetune_wavlm["adapter"]
             else:
-                _checkpoint = torch.load(wav2vec)
-                wav2vec = _checkpoint.pop("config")
-                self.wav2vec = torchaudio.models.wav2vec2_model(**wav2vec)
-                state_dict = _checkpoint.pop("state_dict")
-                self.wav2vec.load_state_dict(state_dict)
-                wav2vec_dim = wav2vec["encoder_embed_dim"]
-                wav2vec_num_layers = wav2vec["encoder_num_layers"]
-
-        # `wav2vec` is a config dictionary understood by `wav2vec2_model`
-        # this branch is typically used by Model.from_pretrained(...)
-        elif isinstance(wav2vec, dict):
-            self.wav2vec = torchaudio.models.wav2vec2_model(**wav2vec)
-            wav2vec_dim = wav2vec["encoder_embed_dim"]
-            wav2vec_num_layers = wav2vec["encoder_num_layers"]
-
-        # Wav2vec should be freeze there for an accurate parameter counting
-        for param in self.wav2vec.parameters():
-            param.requires_grad = False
-
-        if wav2vec_layer < 0:
-            self.wav2vec_weights = nn.Parameter(
-                data=torch.ones(wav2vec_num_layers), requires_grad=True
+                adapter = ["q_proj", "v_proj"]
+            config = LoraConfig(
+                task_type="FEATURE_EXTRACTION",
+                target_modules=adapter,
+                r=32,
+                lora_alpha=32.0,
+                lora_dropout=0.05,
+                init_lora_weights="gaussian",
             )
+            self.ssl = LoraModel(self.ssl, config, "lora-adapter")
+        else:
+            self.automatic_optimization = False
+
+        # if wav2vec_layer < 0:
+        #     self.wav2vec_weights = nn.Parameter(
+        #         data=torch.ones(wav2vec_num_layers), requires_grad=True
+        #     )
 
         lstm = merge_dict(self.LSTM_DEFAULTS, lstm)
         lstm["batch_first"] = True
         linear = merge_dict(self.LINEAR_DEFAULTS, linear)
 
-        self.save_hyperparameters("wav2vec", "wav2vec_layer", "lstm", "linear")
+        self.save_hyperparameters("ssl", "wav2vec_layer", "lstm", "linear")
 
         monolithic = lstm["monolithic"]
         if monolithic:
             multi_layer_lstm = dict(lstm)
             del multi_layer_lstm["monolithic"]
-            self.lstm = nn.LSTM(wav2vec_dim, **multi_layer_lstm)
+            self.lstm = nn.LSTM(model_dim, **multi_layer_lstm)
 
         else:
             num_layers = lstm["num_layers"]
@@ -158,7 +159,7 @@ class SSeRiouSS(Model):
                 [
                     nn.LSTM(
                         (
-                            wav2vec_dim
+                            model_dim
                             if i == 0
                             else lstm["hidden_size"]
                             * (2 if lstm["bidirectional"] else 1)
@@ -227,7 +228,7 @@ class SSeRiouSS(Model):
 
         num_frames = num_samples
         try:
-            for conv_layer in self.wav2vec.feature_extractor.conv_layers:
+            for conv_layer in self.ssl.feature_extractor.conv_layers:
                 num_frames = conv1d_num_frames(
                     num_frames,
                     kernel_size=conv_layer.kernel_size,
@@ -235,13 +236,14 @@ class SSeRiouSS(Model):
                     padding=conv_layer.conv.padding[0],
                     dilation=conv_layer.conv.dilation[0],
                 )
-        except AttributeError:
+        except AttributeError as e:
+            print(e)
             # wav2vec does not contains feature_extractor
-            for conv_layer in self.wav2vec.model.feature_extractor.conv_layers:
+            for conv_layer in self.ssl.model.feature_extractor.conv_layers:
                 num_frames = conv1d_num_frames(
                     num_frames,
-                    kernel_size=conv_layer.kernel_size,
-                    stride=conv_layer.stride,
+                    kernel_size=conv_layer.conv.kernel_size[0],
+                    stride=conv_layer.conv.stride[0],
                     padding=conv_layer.conv.padding[0],
                     dilation=conv_layer.conv.dilation[0],
                 )
@@ -262,23 +264,22 @@ class SSeRiouSS(Model):
         """
         try:
             receptive_field_size = num_frames
-            for conv_layer in reversed(self.wav2vec.feature_extractor.conv_layers):
+            for conv_layer in reversed(self.ssl.feature_extractor.conv_layers):
                 receptive_field_size = conv1d_receptive_field_size(
                     num_frames=receptive_field_size,
                     kernel_size=conv_layer.kernel_size,
                     stride=conv_layer.stride,
                     dilation=conv_layer.conv.dilation[0],
                 )
-        except AttributeError:
+        except AttributeError as e:
+            print(e)
             # print("marche")
             # wav2vec does not contains feature_extractor
-            for conv_layer in reversed(
-                self.wav2vec.model.feature_extractor.conv_layers
-            ):
+            for conv_layer in reversed(self.ssl.model.feature_extractor.conv_layers):
                 receptive_field_size = conv1d_receptive_field_size(
                     num_frames=receptive_field_size,
-                    kernel_size=conv_layer.kernel_size,
-                    stride=conv_layer.stride,
+                    kernel_size=conv_layer.conv.kernel_size[0],
+                    stride=conv_layer.conv.stride[0],
                     dilation=conv_layer.conv.dilation[0],
                 )
         return receptive_field_size
@@ -298,7 +299,7 @@ class SSeRiouSS(Model):
         """
         receptive_field_center = frame
         try:
-            for conv_layer in reversed(self.wav2vec.feature_extractor.conv_layers):
+            for conv_layer in reversed(self.ssl.feature_extractor.conv_layers):
                 receptive_field_center = conv1d_receptive_field_center(
                     receptive_field_center,
                     kernel_size=conv_layer.kernel_size,
@@ -306,15 +307,14 @@ class SSeRiouSS(Model):
                     padding=conv_layer.conv.padding[0],
                     dilation=conv_layer.conv.dilation[0],
                 )
-        except AttributeError:
+        except AttributeError as e:
+            print(e)
             # wav2vec does not contains feature_extractor
-            for conv_layer in reversed(
-                self.wav2vec.model.feature_extractor.conv_layers
-            ):
+            for conv_layer in reversed(self.ssl.model.feature_extractor.conv_layers):
                 receptive_field_center = conv1d_receptive_field_center(
                     receptive_field_center,
-                    kernel_size=conv_layer.kernel_size,
-                    stride=conv_layer.stride,
+                    kernel_size=conv_layer.conv.kernel_size[0],
+                    stride=conv_layer.conv.stride[0],
                     padding=conv_layer.conv.padding[0],
                     dilation=conv_layer.conv.dilation[0],
                 )
@@ -332,21 +332,21 @@ class SSeRiouSS(Model):
         scores : (batch, frame, classes)
         """
 
-        num_layers = (
-            None if self.hparams.wav2vec_layer < 0 else self.hparams.wav2vec_layer
-        )
-
-        with torch.no_grad():
-            outputs, _ = self.wav2vec.extract_features(
-                waveforms.squeeze(1), num_layers=num_layers
-            )
-
-        if num_layers is None:
-            outputs = torch.stack(outputs, dim=-1) @ F.softmax(
-                self.wav2vec_weights, dim=0
-            )
+        # num_layers = (
+        #     None if self.hparams.wav2vec_layer < 0 else self.hparams.wav2vec_layer
+        # )
+        if not self.finetune_wavlm:
+            with torch.no_grad():
+                outputs = self.ssl(waveforms.squeeze(1)).last_hidden_state
         else:
-            outputs = outputs[-1]
+            outputs = self.ssl(waveforms.squeeze(1)).last_hidden_state
+
+        # if num_layers is None:
+        #     outputs = torch.stack(outputs, dim=-1) @ F.softmax(
+        #         self.wav2vec_weights, dim=0
+        #     )
+        # else:
+        #     outputs = outputs[-1]
 
         if self.hparams.lstm["monolithic"]:
             outputs, _ = self.lstm(outputs)

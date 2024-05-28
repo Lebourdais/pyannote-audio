@@ -177,7 +177,6 @@ class Model(pl.LightningModule):
     @cached_property
     def receptive_field(self) -> SlidingWindow:
         """(Internal) frames"""
-
         receptive_field_size = self.receptive_field_size(num_frames=1)
         receptive_field_step = (
             self.receptive_field_size(num_frames=2) - receptive_field_size

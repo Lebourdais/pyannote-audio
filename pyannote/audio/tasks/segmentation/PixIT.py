@@ -58,6 +58,8 @@ from pyannote.audio.utils.random import create_rng_for_worker
 Subsets = list(Subset.__args__)
 Scopes = list(Scope.__args__)
 
+EPS = 1e-7
+
 
 class ValDataset(IterableDataset):
     """Validation dataset class
@@ -173,6 +175,8 @@ class PixIT(SegmentationTask):
         separation_loss_weight: float = 0.5,
         finetune_wavlm: bool = True,
         accumulate_gradient=1,
+        updated_loss=False,
+        oracle_diar=False,
     ):
         super().__init__(
             protocol,
@@ -185,11 +189,14 @@ class PixIT(SegmentationTask):
             cache=cache,
         )
 
+        self.updated_loss = updated_loss
         if not isinstance(protocol, SpeakerDiarizationProtocol):
             raise ValueError(
                 "SpeakerDiarization task requires a SpeakerDiarizationProtocol."
             )
-
+        self.oracle_diar = oracle_diar
+        if self.oracle_diar:
+            warnings.warn("ORACLE DIAR used, be careful")
         # deprecation warnings
         if max_speakers_per_chunk is None and max_num_speakers is not None:
             max_speakers_per_chunk = max_num_speakers
@@ -548,18 +555,22 @@ class PixIT(SegmentationTask):
                 ]
                 start_time = rng.uniform(start, start + region_duration - duration)
 
-                # find speakers that already appeared and all annotations that contain them
+                # Not doing a mixture with the same 2 speakers
+                # Get all annotation chunk before the current chunk
+
                 chunk_annotations = annotations[
                     (annotations["start"] < start_time + duration)
                     & (annotations["end"] > start_time)
                 ]
+                # find speakers that already appeared and all annotations that contain them
                 previous_speaker_labels = list(
                     np.unique(chunk_annotations["file_label_idx"])
                 )
+
+                # For the full annotation, get segments where the speaker has been seen before the current chunk
                 repeated_speaker_annotations = annotations[
                     np.isin(annotations["file_label_idx"], previous_speaker_labels)
                 ]
-
                 if repeated_speaker_annotations.size == 0:
                     # if previous chunk has 0 speakers then just sample from all annotated regions again
                     first_chunk = self.prepare_chunk(file_id, start_time, duration)
@@ -591,6 +602,7 @@ class PixIT(SegmentationTask):
                             repeated_speaker_annotations["end"][0],
                         ]
                     ]
+
                     for _, start, end, _, _, _ in repeated_speaker_annotations:
                         previous = merged_repeated_segments[-1]
                         if start <= previous[1]:
@@ -604,6 +616,7 @@ class PixIT(SegmentationTask):
                     previous_time = self.prepared_data["annotations-regions"]["start"][
                         annotated_region_indices[0]
                     ]
+
                     for segment in merged_repeated_segments:
                         if (
                             segment[0]
@@ -614,7 +627,9 @@ class PixIT(SegmentationTask):
                                 annotated_region_indices[current_region_index]
                             ]
                         ):
+
                             current_region_index += 1
+
                             previous_time = self.prepared_data["annotations-regions"][
                                 "start"
                             ][annotated_region_indices[current_region_index]]
@@ -915,12 +930,14 @@ class PixIT(SegmentationTask):
             num_active_speakers_mix2,
         ) = self.create_mixtures_of_mixtures(mix1, mix2, target[0::2], target[1::2])
         target = torch.cat((target[0::2], target[1::2], mom_target), dim=0)
-
-        diarization, sources = self.model(torch.cat((mix1, mix2, mom), dim=0))
+        diarization, sources = self.model(
+            torch.cat((mix1, mix2, mom), dim=0) + EPS
+        )  # Avoid 0
+        if self.oracle_diar:
+            diarization = target
         # mix1_sources = sources[: bsz // 2]
         # mix2_sources = sources[bsz // 2 : bsz]
         mom_sources = sources[bsz:]
-
         batch_size, num_frames, _ = diarization.shape
         # (batch_size, num_frames, num_classes)
 
@@ -931,14 +948,78 @@ class PixIT(SegmentationTask):
             torch.ones(batch_size, num_frames, 1, device=self.model.device),
         )
         # (batch_size, num_frames, 1)
-
-        permutated_diarization, permutations = permutate(target, diarization)
+        try:
+            permutated_diarization, permutations = permutate(target, diarization)
+        except ValueError:
+            print(batch["meta"])
+            print(f"{num_active_speakers_mix1=}")
+            print(f"{num_active_speakers_mix2=}")
+            print(f"{batch['X'].mean(dim=-1)=}")
+            print(f"{batch['X'].shape=}")
+            print(f"{torch.isnan(diarization).any()=}")
 
         seg_loss = self.segmentation_loss(permutated_diarization, target, weight=weight)
+        if not self.updated_loss:
+            separation_loss = self.mixit_loss(
+                mom_sources.transpose(1, 2), torch.stack((mix1, mix2)).transpose(0, 1)
+            ).mean()
+        else:
+            sep_mask = (num_active_speakers_mix1 != 0) & (num_active_speakers_mix2 != 0)
+            if sep_mask.sum == 0:
+                return (
+                    seg_loss,
+                    self.mixit_loss(
+                        mom_sources.transpose(1, 2),
+                        torch.stack((mix1, mix2)).transpose(0, 1),
+                    ).mean(),
+                    diarization,
+                    permutated_diarization,
+                    target,
+                )
+            optimal_loss = (
+                torch.sum(
+                    self.mixit_loss(
+                        mom_sources.transpose(1, 2),
+                        torch.stack((mix1, mix2)).transpose(0, 1),
+                    )[sep_mask]
+                )
+                / sep_mask.sum()
+            )
 
-        separation_loss = self.mixit_loss(
-            mom_sources.transpose(1, 2), torch.stack((mix1, mix2)).transpose(0, 1)
-        ).mean()
+            middle_point = 0.30
+            alpha = self.sigmoid(
+                seg_loss - middle_point, lam=20
+            )  # SegLoss typically between 0.2 and 0.5, need a high slope
+            self.model.log(
+                "alpha",
+                alpha,
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+
+            common_loss = (
+                torch.sum(
+                    self.common_loss(
+                        mom_sources,
+                        torch.stack((mix1, mix2)).transpose(0, 1),
+                        permutations,
+                        num_active_speakers_mix1,
+                        num_active_speakers_mix2,
+                    )[sep_mask]
+                )
+                / sep_mask.sum()
+            )
+            self.model.log(
+                "loss/diff",
+                torch.sqrt((optimal_loss - common_loss) ** 2),
+                on_step=True,
+                on_epoch=True,
+                prog_bar=True,
+                logger=True,
+            )
+            separation_loss = alpha * optimal_loss + (1 - alpha) * common_loss
 
         return (
             seg_loss,
@@ -947,6 +1028,43 @@ class PixIT(SegmentationTask):
             permutated_diarization,
             target,
         )
+
+    def sigmoid(self, x, lam=1):
+        return 1 / (1 + torch.exp(-lam * x))
+
+    def P2A(self, P, num_active_speakers_mix1, num_active_speakers_mix2):
+        """
+        Input: B * C * C
+        Output: B * S
+        """
+        _, max_spk = P.shape
+        A = torch.zeros((max_spk)).cuda()
+
+        # num_spk_batch = num_active_speakers_mix1 + num_active_speakers_mix2
+        A[(torch.arange(max_spk).cuda() >= num_active_speakers_mix1)] = 1
+
+        permA = A @ P
+        return permA, A
+
+    def common_loss(self, hyp, ref, permutations, n_spk1, n_spk2):
+        batch_size, frame, max_spk = hyp.shape
+        permutation_matrix = torch.zeros((batch_size, max_spk, max_spk)).cuda()
+        # acc = 0
+        source1_acc = []
+        source2_acc = []
+        for b in range(batch_size):
+            permutation_matrix[b, torch.arange(0, max_spk).cuda(), permutations[b]] = 1
+            permA, A = self.P2A(permutation_matrix[b], n_spk1[b], n_spk2[b])
+
+            source1 = hyp[b, :, permA == 0].sum(-1)
+            source2 = hyp[b, :, permA == 1].sum(-1)
+            source1_acc.append(source1)
+            source2_acc.append(source2)
+        source_hyp = torch.stack(
+            (torch.stack(source1_acc), torch.stack(source2_acc)), dim=1
+        )
+        loss = multisrc_neg_sisdr(source_hyp, ref)
+        return loss
 
     def training_step(self, batch, batch_idx: int):
         """Compute PixIT loss for training
@@ -994,10 +1112,12 @@ class PixIT(SegmentationTask):
             prog_bar=False,
             logger=True,
         )
-
-        loss = (
-            1 - self.separation_loss_weight
-        ) * seg_loss + self.separation_loss_weight * separation_loss
+        if separation_loss is None:
+            loss = seg_loss
+        else:
+            loss = (
+                1 - self.separation_loss_weight
+            ) * seg_loss + self.separation_loss_weight * separation_loss
         loss /= self.accumulate_gradient
         # skip batch if something went wrong for some reason
         if torch.isnan(loss):

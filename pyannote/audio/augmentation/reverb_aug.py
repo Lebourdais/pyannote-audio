@@ -12,20 +12,24 @@ from torchaudio.transforms import FFTConvolve
 
 class ReverbAugmentation(BaseWaveformTransform):
     """
-    Create a new sample by mixing it with another random sample from the same batch
+    Add reverb to a sample using RiR augmentation
 
     Signal-to-noise ratio (where "noise" is the second random sample) is selected
     randomly between `min_snr_in_db` and `max_snr_in_db`.
 
     Parameters
     ----------
-    min_snr_in_db : float, optional
-        Defaults to 0.0
-    max_snr_in_db : float, optional
-        Defaults to 5.0
-    max_num_speakers: int, optional
-        Maximum number of speakers in mixtures.  Defaults to actual maximum number
-        of speakers in each batch.
+    width_range : float, optional
+        Width in of the room in meter
+    depth_range : float, optional
+        Depth in of the room in meter
+    height_range: int, optional
+        Height in of the room in meter
+    max_order:
+        max number of reflexion
+    absorption:
+        Coefficient of the walls
+
     """
 
     supported_modes = {"per_example", "per_channel"}

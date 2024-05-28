@@ -153,6 +153,8 @@ class SpeakerDiarization(SegmentationTask):
         ] = None,  # deprecated in favor of `max_speakers_per_chunk``
         loss: Literal["bce", "mse"] = None,  # deprecated
         double: bool = False,
+        finetune_wavlm=None,
+        accumulate_gradient=1,
     ):
         super().__init__(
             protocol,
@@ -165,6 +167,8 @@ class SpeakerDiarization(SegmentationTask):
             metric=metric,
             cache=cache,
         )
+        self.finetune_wavlm = finetune_wavlm
+        self.accumulate_gradient = accumulate_gradient
         self.double = double
         if not isinstance(protocol, SpeakerDiarizationProtocol):
             raise ValueError(
@@ -545,6 +549,10 @@ class SpeakerDiarization(SegmentationTask):
         loss : {str: torch.tensor}
             {"loss": loss}
         """
+        if self.finetune_wavlm is not None and self.finetune_wavlm["dual_optimizer"]:
+            wavlm_opt, rest_opt = self.model.optimizers()
+            wavlm_opt.zero_grad()
+            rest_opt.zero_grad()
 
         # target
         target = batch["y"]
@@ -652,6 +660,23 @@ class SpeakerDiarization(SegmentationTask):
             prog_bar=False,
             logger=True,
         )
+
+        if self.finetune_wavlm is not None and self.finetune_wavlm["dual_optimizer"]:
+
+            self.model.manual_backward(loss)
+            self.model.clip_gradients(
+                wavlm_opt,
+                gradient_clip_val=self.model.gradient_clip_val,
+                gradient_clip_algorithm="norm",
+            )
+            self.model.clip_gradients(
+                rest_opt,
+                gradient_clip_val=self.model.gradient_clip_val,
+                gradient_clip_algorithm="norm",
+            )
+            if (batch_idx + 1) % self.accumulate_gradient == 0:
+                wavlm_opt.step()
+                rest_opt.step()
 
         return {"loss": loss}
 

@@ -318,35 +318,44 @@ class ToTaToNet(Model):
         scores : (batch, frame, classes)
         sources : (batch, sample, n_sources)
         """
+        assert not torch.isnan(waveforms).any(), "Waveform is NaN"
         bsz = waveforms.shape[0]
         tf_rep = self.encoder(waveforms)
+        # assert not torch.isnan(tf_rep).any(), f"Encoder is NaN : {tf_rep}"
+
         if self.use_wavlm:
             wavlm_rep = self.wavlm(waveforms.squeeze(1)).last_hidden_state
             wavlm_rep = wavlm_rep.transpose(1, 2)
             wavlm_rep = wavlm_rep.repeat_interleave(self.wavlm_scaling, dim=-1)
             wavlm_rep = pad_x_to_y(wavlm_rep, tf_rep)
+            # assert not torch.isnan(wavlm_rep).any(), "WavLM output is NaN"
             wavlm_rep = torch.cat((tf_rep, wavlm_rep), dim=1)
             masks = self.masker(wavlm_rep)
+            # assert not torch.isnan(masks).any(), "Masker output is NaN"
         else:
             masks = self.masker(tf_rep)
         # shape: (batch, nsrc, nfilters, nframes)
         masked_tf_rep = masks * tf_rep.unsqueeze(1)
         decoded_sources = self.decoder(masked_tf_rep)
+        # assert not torch.isnan(decoded_sources).any(), "Decoder output is NaN"
         decoded_sources = pad_x_to_y(decoded_sources, waveforms)
         decoded_sources = decoded_sources.transpose(1, 2)
         outputs = torch.flatten(masked_tf_rep, start_dim=0, end_dim=1)
         # shape (batch * nsrc, nfilters, nframes)
         outputs = self.average_pool(outputs)
+        # assert not torch.isnan(outputs).any(), "Pooling output is NaN"
         outputs = outputs.transpose(1, 2)
         # shape (batch, nframes, nfilters)
         if self.use_lstm:
             outputs, _ = self.lstm(outputs)
+            # assert not torch.isnan(outputs).any(), "LSTM output is NaN"
         if self.hparams.linear["num_layers"] > 0:
             for linear in self.linear:
                 outputs = F.leaky_relu(linear(outputs))
         if not self.use_lstm and self.hparams.linear["num_layers"] == 0:
             outputs = (outputs**2).sum(dim=2).unsqueeze(-1)
         outputs = self.classifier(outputs)
+        # assert not torch.isnan(outputs).any(), "Classifier output is NaN"
         outputs = outputs.reshape(bsz, self.n_sources, -1)
         outputs = outputs.transpose(1, 2)
 
