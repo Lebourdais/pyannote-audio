@@ -22,6 +22,7 @@
 
 import itertools
 import math
+import os
 import random
 import warnings
 from collections import Counter
@@ -51,6 +52,7 @@ from pyannote.audio.torchmetrics import (
     OptimalMissedDetectionRate,
     OptimalSpeakerConfusionRate,
 )
+from pyannote.audio.utils.layer import Transpose
 from pyannote.audio.utils.loss import binary_cross_entropy
 from pyannote.audio.utils.permutation import permutate
 from pyannote.audio.utils.random import create_rng_for_worker
@@ -175,8 +177,9 @@ class PixIT(SegmentationTask):
         separation_loss_weight: float = 0.5,
         finetune_wavlm: bool = True,
         accumulate_gradient=1,
-        updated_loss=False,
-        oracle_diar=False,
+        n_opti=2,
+        loss_mode="standard",
+        loss_ckpt_path=None,
     ):
         super().__init__(
             protocol,
@@ -189,15 +192,49 @@ class PixIT(SegmentationTask):
             cache=cache,
         )
 
-        self.updated_loss = updated_loss
+        self.n_opti = n_opti
+        self.loss_ckpt_path = loss_ckpt_path
+
+        self.loss_mode = loss_mode
+        if "perm" in self.loss_mode:
+            self.batch_norm = torch.nn.BatchNorm1d(max_speakers_per_chunk)
+
+            if self.loss_ckpt_path is not None:
+                batch_norm_ckpt = f"{loss_ckpt_path}/batch_norm.ckpt"
+                if os.path.isfile(batch_norm_ckpt):
+                    print(f"Loading batch_norm from {loss_ckpt_path}")
+                    self.batch_norm.load_state_dict(torch.load(batch_norm_ckpt))
+                self.batch_norm.cuda()
+        if self.loss_mode == "perm_epoch":
+
+            self.alpha = 1
+        if "train" in self.loss_mode:
+
+            loss, alpha = self.loss_mode.split(":")
+            self.selection = torch.nn.Sequential(
+                torch.nn.Linear(max_speakers_per_chunk, max_speakers_per_chunk),
+                torch.nn.Sigmoid(),
+            )
+            self.projection = torch.nn.Sequential(
+                torch.nn.Linear(max_speakers_per_chunk, 2),
+                torch.nn.Softmax(),
+                torch.nn.Sigmoid(),
+            )
+
+            self.M = torch.nn.Sequential(
+                self.selection, Transpose(-1, -2), self.projection, Transpose(-1, -2)
+            ).cuda()
+            M_ckpt = f"{loss_ckpt_path}/M.ckpt"
+            if os.path.isfile(M_ckpt):
+                print(f"Loading Transformation from {loss_ckpt_path}")
+                self.M.load_state_dict(torch.load(M_ckpt))
+            self.kld = torch.nn.KLDivLoss(reduce="batchmean")
+            self.alpha = float(alpha)
         if not isinstance(protocol, SpeakerDiarizationProtocol):
             raise ValueError(
                 "SpeakerDiarization task requires a SpeakerDiarizationProtocol."
             )
-        self.oracle_diar = oracle_diar
-        if self.oracle_diar:
-            warnings.warn("ORACLE DIAR used, be careful")
-        # deprecation warnings
+
         if max_speakers_per_chunk is None and max_num_speakers is not None:
             max_speakers_per_chunk = max_num_speakers
             warnings.warn(
@@ -799,6 +836,8 @@ class PixIT(SegmentationTask):
         permutated_prediction: torch.Tensor,
         target: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
+        return_dist=False,
+        reduction="mean",
     ) -> torch.Tensor:
         """Permutation-invariant segmentation loss
 
@@ -818,7 +857,7 @@ class PixIT(SegmentationTask):
         """
 
         seg_loss = binary_cross_entropy(
-            permutated_prediction, target.float(), weight=weight
+            permutated_prediction, target.float(), weight=weight, reduction=reduction
         )
 
         return seg_loss
@@ -878,7 +917,7 @@ class PixIT(SegmentationTask):
 
         return mom, targets, num_active_speakers_mix1, num_active_speakers_mix2
 
-    def common_step(self, batch):
+    def common_step(self, batch, batch_idx):
         """Common step for training and validation
 
         Parameters
@@ -899,6 +938,9 @@ class PixIT(SegmentationTask):
         target : torch.Tensor
             Diarization target.
         """
+        # logging = False
+        # if batch_idx is not None and (batch_idx + 1) % 100 == 0:
+        #     loggig = True
 
         target = batch["y"]
         # (batch_size, num_frames, num_speakers)
@@ -933,8 +975,6 @@ class PixIT(SegmentationTask):
         diarization, sources = self.model(
             torch.cat((mix1, mix2, mom), dim=0) + EPS
         )  # Avoid 0
-        if self.oracle_diar:
-            diarization = target
         # mix1_sources = sources[: bsz // 2]
         # mix2_sources = sources[bsz // 2 : bsz]
         mom_sources = sources[bsz:]
@@ -949,7 +989,9 @@ class PixIT(SegmentationTask):
         )
         # (batch_size, num_frames, 1)
         try:
-            permutated_diarization, permutations = permutate(target, diarization)
+            permutated_diarization, permutations, cost = permutate(
+                target, diarization, return_cost=True
+            )
         except ValueError:
             print(batch["meta"])
             print(f"{num_active_speakers_mix1=}")
@@ -958,14 +1000,23 @@ class PixIT(SegmentationTask):
             print(f"{batch['X'].shape=}")
             print(f"{torch.isnan(diarization).any()=}")
 
-        seg_loss = self.segmentation_loss(permutated_diarization, target, weight=weight)
-        if not self.updated_loss:
+        if self.loss_mode == "standard":
+            seg_loss = self.segmentation_loss(
+                permutated_diarization, target, weight=weight
+            )
+
             separation_loss = self.mixit_loss(
                 mom_sources.transpose(1, 2), torch.stack((mix1, mix2)).transpose(0, 1)
             ).mean()
-        else:
+        elif "perm" in self.loss_mode:
+
+            raw_seg_loss = self.segmentation_loss(
+                permutated_diarization, target, weight=None, reduction="none"
+            )
+            seg_loss = raw_seg_loss.mean()
             sep_mask = (num_active_speakers_mix1 != 0) & (num_active_speakers_mix2 != 0)
-            if sep_mask.sum == 0:
+
+            if sep_mask.sum() == 0:
                 return (
                     seg_loss,
                     self.mixit_loss(
@@ -976,50 +1027,188 @@ class PixIT(SegmentationTask):
                     permutated_diarization,
                     target,
                 )
-            optimal_loss = (
-                torch.sum(
+
+            optimal_loss = self.mixit_loss(
+                mom_sources.transpose(1, 2),
+                torch.stack((mix1, mix2)).transpose(0, 1),
+            )
+            Ap = self.P2A_Joonas(
+                permutations, num_active_speakers_mix1, num_active_speakers_mix2
+            ).cuda()
+
+            if self.loss_mode == "perm_epoch":
+                alpha = self.alpha
+                common_loss = self.calc_loss(
+                    Ap,
+                    num_active_speakers_mix1,
+                    num_active_speakers_mix2,
+                    mom_sources,
+                    mix1,
+                    mix2,
+                )
+            elif self.loss_mode == "perm_batch_norm":
+
+                seg_loss_norm = self.batch_norm(
+                    raw_seg_loss.detach().clone().permute(0, 2, 1)
+                )
+
+                self.model.log(
+                    "loss/batch_norm_gamma",
+                    self.batch_norm.state_dict()["weight"].mean(),
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                    logger=True,
+                )
+                self.model.log(
+                    "loss/batch_norm_beta",
+                    self.batch_norm.state_dict()["bias"].mean(),
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                    logger=True,
+                )
+                alpha = self.sigmoid(torch.mean(torch.mean(seg_loss_norm, 2), 1))
+
+                self.model.log(
+                    "loss/train/segmentation_stepwise",
+                    seg_loss_norm.mean(),
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=True,
+                    logger=True,
+                )
+                self.model.log(
+                    "loss/train/segmentation_stepwise",
+                    alpha.mean(),
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=True,
+                    logger=True,
+                )
+                common_loss, mask_loss = self.calc_loss(
+                    Ap,
+                    num_active_speakers_mix1,
+                    num_active_speakers_mix2,
+                    mom_sources,
+                    mix1,
+                    mix2,
+                    reduce="none",
+                )
+            else:
+                middle_point = 0.30
+                with torch.no_grad():
+                    alpha = self.sigmoid(
+                        seg_loss.detach().clone() - middle_point, lam=20
+                    )  # SegLoss typically between 0.2 and 0.5, need a high slope
+                    # alpha = 1
+                common_loss = self.calc_loss(
+                    Ap,
+                    num_active_speakers_mix1,
+                    num_active_speakers_mix2,
+                    mom_sources,
+                    mix1,
+                    mix2,
+                )
+
+                self.model.log(
+                    "loss/train/segmentation_stepwise",
+                    seg_loss,
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                    logger=True,
+                )
+                self.model.log(
+                    "alpha",
+                    alpha,
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=True,
+                    logger=True,
+                )
+
+            # common_loss = self.Joonas_perm(permutations, num_active_speakers_mix1,num_active_speakers_mix2,mom_sources,mix1,mix2)
+
+            if common_loss is None:
+                separation_loss = optimal_loss
+            else:
+                self.model.log(
+                    "loss/diff",
+                    torch.sqrt((optimal_loss.mean() - common_loss.mean()) ** 2),
+                    on_step=True,
+                    on_epoch=False,
+                    prog_bar=False,
+                    logger=True,
+                )
+                if self.loss_mode == "perm_batch_norm":
+                    size = mask_loss.shape[0]
+                    loss_mixit = alpha[-size:][mask_loss] * torch.tile(
+                        optimal_loss, (mask_loss.sum(),)
+                    )
+                    loss_perm = (1 - alpha[-size:][mask_loss]) * common_loss
+                    separation_loss = torch.mean(loss_mixit + loss_perm)
+                else:
+                    separation_loss = (
+                        alpha * optimal_loss.mean() + (1 - alpha) * common_loss
+                    )
+
+        elif "train" in self.loss_mode:
+            cost = cost.cuda()
+            seg_loss = self.segmentation_loss(
+                permutated_diarization, target, weight=weight
+            )
+            sep_mask = (num_active_speakers_mix1 != 0) & (num_active_speakers_mix2 != 0)
+
+            if sep_mask.sum() == 0:
+                return (
+                    seg_loss,
                     self.mixit_loss(
                         mom_sources.transpose(1, 2),
                         torch.stack((mix1, mix2)).transpose(0, 1),
-                    )[sep_mask]
+                    ).mean(),
+                    diarization,
+                    permutated_diarization,
+                    target,
                 )
-                / sep_mask.sum()
-            )
 
-            middle_point = 0.30
-            alpha = self.sigmoid(
-                seg_loss - middle_point, lam=20
-            )  # SegLoss typically between 0.2 and 0.5, need a high slope
+            A = self.P2A_Joonas(
+                permutations, num_active_speakers_mix1, num_active_speakers_mix2
+            ).cuda()
+            # self.Joonas_perm(permutations, num_active_speakers_mix1,num_active_speakers_mix2,mom_sources,mix1,mix2)
+
+            A_hat = self.M(
+                cost[
+                    -len(num_active_speakers_mix1) : -(
+                        len(num_active_speakers_mix1) // 2
+                    )
+                ]
+            )
+            kld_loss = self.kld(A_hat, A)
+            alpha = self.alpha
             self.model.log(
-                "alpha",
-                alpha,
+                "loss/kld",
+                kld_loss,
                 on_step=True,
                 on_epoch=True,
-                prog_bar=True,
+                prog_bar=False,
                 logger=True,
             )
-
-            common_loss = (
-                torch.sum(
-                    self.common_loss(
-                        mom_sources,
-                        torch.stack((mix1, mix2)).transpose(0, 1),
-                        permutations,
-                        num_active_speakers_mix1,
-                        num_active_speakers_mix2,
-                    )[sep_mask]
-                )
-                / sep_mask.sum()
+            sep_loss = self.calc_loss(
+                A_hat,
+                num_active_speakers_mix1,
+                num_active_speakers_mix2,
+                mom_sources,
+                mix1,
+                mix2,
             )
-            self.model.log(
-                "loss/diff",
-                torch.sqrt((optimal_loss - common_loss) ** 2),
-                on_step=True,
-                on_epoch=True,
-                prog_bar=True,
-                logger=True,
-            )
-            separation_loss = alpha * optimal_loss + (1 - alpha) * common_loss
+            if sep_loss is None:
+                separation_loss = self.mixit_loss(
+                    mom_sources.transpose(1, 2),
+                    torch.stack((mix1, mix2)).transpose(0, 1),
+                ).mean()
+            else:
+                separation_loss = alpha * sep_loss + (1 - alpha) * kld_loss
 
         return (
             seg_loss,
@@ -1032,39 +1221,128 @@ class PixIT(SegmentationTask):
     def sigmoid(self, x, lam=1):
         return 1 / (1 + torch.exp(-lam * x))
 
-    def P2A(self, P, num_active_speakers_mix1, num_active_speakers_mix2):
-        """
-        Input: B * C * C
-        Output: B * S
-        """
-        _, max_spk = P.shape
-        A = torch.zeros((max_spk)).cuda()
+    def P2A_Joonas(
+        self, permutations, num_active_speakers_mix1, num_active_speakers_mix2
+    ):
+        batch_size = (
+            len(num_active_speakers_mix1) // 2
+        )  # A batch is composed of two files.
+        mom_permutations = permutations[
+            batch_size:
+        ]  # permutations for the mixture of mixture
+        speaker_idx_mix1 = [
+            [mom_permutations[i][j] for j in range(num_active_speakers_mix1[i])]
+            for i in range(batch_size)
+        ]
 
-        # num_spk_batch = num_active_speakers_mix1 + num_active_speakers_mix2
-        A[(torch.arange(max_spk).cuda() >= num_active_speakers_mix1)] = 1
+        speaker_idx_mix2 = [
+            [
+                mom_permutations[i][j]
+                for j in range(
+                    num_active_speakers_mix1[i],
+                    num_active_speakers_mix1[i] + num_active_speakers_mix2[i],
+                )
+            ]
+            for i in range(batch_size)
+        ]
+        A = torch.zeros((batch_size, 2, 3))
+        for ii in range(batch_size):
+            A[ii, 0, speaker_idx_mix1[ii]] = 1
+            A[ii, 1, speaker_idx_mix2[ii]] = 1
+        # A = np.array([speaker_idx_mix1[i]+speaker_idx_mix2[i] for i in range(batch_size // 2)])
+        return A
 
-        permA = A @ P
-        return permA, A
+    def A2idx(self, A):
+        speaker_idx_mix1 = []
+        speaker_idx_mix2 = []
+        for batch in A:
+            tmp1 = []
+            tmp2 = []
+            for ii in range(len(batch[0])):
+                if batch[0, ii] > 0.5:
+                    tmp1.append(ii)
+                if batch[1, ii] > 0.5:
+                    tmp2.append(ii)
+            tmp1 = np.array(tmp1)
+            tmp2 = np.array(tmp2)
+            speaker_idx_mix1.append(tmp1)
+            speaker_idx_mix2.append(tmp2)
+        return speaker_idx_mix1, speaker_idx_mix2
 
-    def common_loss(self, hyp, ref, permutations, n_spk1, n_spk2):
-        batch_size, frame, max_spk = hyp.shape
-        permutation_matrix = torch.zeros((batch_size, max_spk, max_spk)).cuda()
-        # acc = 0
-        source1_acc = []
-        source2_acc = []
-        for b in range(batch_size):
-            permutation_matrix[b, torch.arange(0, max_spk).cuda(), permutations[b]] = 1
-            permA, A = self.P2A(permutation_matrix[b], n_spk1[b], n_spk2[b])
+    def calc_loss(
+        self,
+        A,
+        num_active_speakers_mix1,
+        num_active_speakers_mix2,
+        mom_sources,
+        mix1,
+        mix2,
+        reduce="mean",
+    ):
+        batch_size = mom_sources.shape[0] // 2
 
-            source1 = hyp[b, :, permA == 0].sum(-1)
-            source2 = hyp[b, :, permA == 1].sum(-1)
-            source1_acc.append(source1)
-            source2_acc.append(source2)
-        source_hyp = torch.stack(
-            (torch.stack(source1_acc), torch.stack(source2_acc)), dim=1
+        speaker_idx_mix1, speaker_idx_mix2 = self.A2idx(A)
+        # est_mixes = []
+        mix1_speech = []
+        mix2_speech = []
+        est_mix1_speech = []
+        est_mix2_speech = []
+        mask = torch.zeros(batch_size * 2)
+        for i in range(batch_size):
+            # zero-speaker mixtures should be ignored for separation loss since
+            # the prediction would be a silent signal and the loss would explode
+            if num_active_speakers_mix1[i] > 0:
+                est_mix1 = mom_sources[i, :, speaker_idx_mix1[i]].sum(1)
+                mix1_speech.append(mix1[i])
+                est_mix1_speech.append(est_mix1)
+                mask[i] = 1
+            if num_active_speakers_mix2[i] > 0:
+                est_mix2 = mom_sources[i, :, speaker_idx_mix2[i]].sum(1)
+                mix2_speech.append(mix2[i])
+                est_mix2_speech.append(est_mix2)
+                mask[i + batch_size] = 1
+        if (len(est_mix1_speech) == 0 and len(est_mix2_speech) == 0) or (
+            len(mix1_speech) == 0 and len(mix2_speech) == 0
+        ):
+            if reduce == "mean":
+                return None
+            else:
+                return None, None
+        if reduce == "mean":
+            common_loss = (
+                multisrc_neg_sisdr(
+                    torch.stack(est_mix1_speech + est_mix2_speech).unsqueeze(1),
+                    torch.stack(mix1_speech + mix2_speech).unsqueeze(1),
+                )
+            ).mean()
+        elif reduce == "none":
+            common_loss = multisrc_neg_sisdr(
+                torch.stack(est_mix1_speech + est_mix2_speech).unsqueeze(1),
+                torch.stack(mix1_speech + mix2_speech).unsqueeze(1),
+            )
+            return common_loss, mask.bool()
+        return common_loss
+
+    def Joonas_perm(
+        self,
+        permutations,
+        num_active_speakers_mix1,
+        num_active_speakers_mix2,
+        mom_sources,
+        mix1,
+        mix2,
+    ):
+        A = self.P2A_Joonas(
+            permutations, num_active_speakers_mix1, num_active_speakers_mix2
         )
-        loss = multisrc_neg_sisdr(source_hyp, ref)
-        return loss
+        return self.calc_loss(
+            A,
+            num_active_speakers_mix1,
+            num_active_speakers_mix2,
+            mom_sources,
+            mix1,
+            mix2,
+        )
 
     def training_step(self, batch, batch_idx: int):
         """Compute PixIT loss for training
@@ -1081,12 +1359,18 @@ class PixIT(SegmentationTask):
         loss : {str: torch.tensor}
             {"loss": loss}
         """
+        torch.autograd.set_detect_anomaly(True)
         # finetuning wavlm with a smaller learning rate requires two optimizers
         # and manual gradient stepping
         if self.finetune_wavlm:
-            wavlm_opt, rest_opt = self.model.optimizers()
-            wavlm_opt.zero_grad()
-            rest_opt.zero_grad()
+            if not self.model.automatic_optimization:
+                if self.n_opti == 2:
+
+                    wavlm_opt, rest_opt = self.model.optimizers()
+                    wavlm_opt.zero_grad()
+                    rest_opt.zero_grad()
+                elif self.n_opti == 3:
+                    wavlm_opt, seg_opt, sep_opt = self.model.optimizers()
 
         (
             seg_loss,
@@ -1094,35 +1378,88 @@ class PixIT(SegmentationTask):
             diarization,
             permutated_diarization,
             target,
-        ) = self.common_step(batch)
+        ) = self.common_step(batch, batch_idx)
         self.model.log(
             "loss/train/separation",
             separation_loss,
             on_step=False,
             on_epoch=True,
-            prog_bar=False,
+            prog_bar=True,
             logger=True,
         )
 
         self.model.log(
             "loss/train/segmentation",
             seg_loss,
-            on_step=False,
+            on_step=True,
             on_epoch=True,
             prog_bar=False,
             logger=True,
         )
-        if separation_loss is None:
-            loss = seg_loss
-        else:
+        if self.n_opti == 2:
+            if separation_loss is None:
+                loss = seg_loss
+            else:
+                loss = (
+                    1 - self.separation_loss_weight
+                ) * seg_loss + self.separation_loss_weight * separation_loss
+            loss /= self.accumulate_gradient
+            # skip batch if something went wrong for some reason
+            if torch.isnan(loss):
+                return None
+
+            if self.finetune_wavlm:
+                if not self.model.automatic_optimization:
+                    self.model.manual_backward(loss)
+                    self.model.clip_gradients(
+                        wavlm_opt,
+                        gradient_clip_val=self.model.gradient_clip_val,
+                        gradient_clip_algorithm="norm",
+                    )
+                    self.model.clip_gradients(
+                        rest_opt,
+                        gradient_clip_val=self.model.gradient_clip_val,
+                        gradient_clip_algorithm="norm",
+                    )
+                    if (batch_idx + 1) % self.accumulate_gradient == 0:
+                        wavlm_opt.step()
+                        rest_opt.step()
+                else:
+                    pass
+
+        elif self.n_opti == 3:
+            if separation_loss is None:
+                return None
             loss = (
                 1 - self.separation_loss_weight
             ) * seg_loss + self.separation_loss_weight * separation_loss
-        loss /= self.accumulate_gradient
-        # skip batch if something went wrong for some reason
-        if torch.isnan(loss):
-            return None
 
+            seg_opt.zero_grad()
+            self.model.manual_backward(seg_loss, retain_graph=True)
+            self.model.clip_gradients(
+                seg_opt,
+                gradient_clip_val=self.model.gradient_clip_val,
+                gradient_clip_algorithm="norm",
+            )
+
+            sep_opt.zero_grad()
+            self.model.manual_backward(separation_loss, retain_graph=True)
+            self.model.clip_gradients(
+                sep_opt,
+                gradient_clip_val=self.model.gradient_clip_val,
+                gradient_clip_algorithm="norm",
+            )
+
+            wavlm_opt.zero_grad()
+            self.model.manual_backward(loss)
+            self.model.clip_gradients(
+                wavlm_opt,
+                gradient_clip_val=self.model.gradient_clip_val,
+                gradient_clip_algorithm="norm",
+            )
+            seg_opt.step()
+            sep_opt.step()
+            wavlm_opt.step()
         self.model.log(
             "loss/train",
             loss,
@@ -1131,24 +1468,6 @@ class PixIT(SegmentationTask):
             prog_bar=False,
             logger=True,
         )
-
-        if self.finetune_wavlm:
-
-            self.model.manual_backward(loss)
-            self.model.clip_gradients(
-                wavlm_opt,
-                gradient_clip_val=self.model.gradient_clip_val,
-                gradient_clip_algorithm="norm",
-            )
-            self.model.clip_gradients(
-                rest_opt,
-                gradient_clip_val=self.model.gradient_clip_val,
-                gradient_clip_algorithm="norm",
-            )
-            if (batch_idx + 1) % self.accumulate_gradient == 0:
-                wavlm_opt.step()
-                rest_opt.step()
-
         return {"loss": loss}
 
     def default_metric(
@@ -1182,8 +1501,12 @@ class PixIT(SegmentationTask):
             diarization,
             permutated_diarization,
             target,
-        ) = self.common_step(batch)
-
+        ) = self.common_step(batch, None)
+        with torch.no_grad():
+            middle_point = 0.25
+            self.alpha = self.sigmoid(
+                seg_loss.detach().clone() - middle_point, lam=20
+            )  # SegLoss typically between 0.1 and 0.5, need a high slope
         self.model.log(
             "loss/val/separation",
             separation_loss,
@@ -1227,7 +1550,12 @@ class PixIT(SegmentationTask):
             prog_bar=True,
             logger=True,
         )
-
+        if "perm" in self.loss_mode:
+            torch.save(
+                self.batch_norm.state_dict(), f"{self.loss_ckpt_path}/batch_norm.ckpt"
+            )
+        if "train" in self.loss_mode:
+            torch.save(self.M.state_dict(), f"{self.loss_ckpt_path}/M.ckpt")
         # log first batch visualization every 2^n epochs.
         if (
             self.model.current_epoch == 0

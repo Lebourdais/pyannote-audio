@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from asteroid.masknn import DPRNN
 from asteroid.utils.torch_utils import pad_x_to_y
 from asteroid_filterbanks import make_enc_dec
+from peft import LoraConfig, LoraModel
 from pyannote.core.utils.generators import pairwise
 from transformers import AutoModel
 
@@ -116,6 +117,7 @@ class ToTaToNet(Model):
     FEATURES_DEFAULTS = {
         "wavlm_version": "microsoft/wavlm-large",
         "use_wavlm": True,
+        "finetune": "full",
     }
     DIAR_DEFAULTS = {"frames_per_second": 125}
 
@@ -216,7 +218,21 @@ class ToTaToNet(Model):
                 ]
             )
         self.gradient_clip_val = gradient_clip_val
-        self.automatic_optimization = False
+        if features["finetune"] == "all":
+            self.automatic_optimization = False
+        else:
+            self.automatic_optimization = True
+            if features["finetune"] == "lora":
+                adapter = ["q_proj", "v_proj"]
+                config = LoraConfig(
+                    task_type="FEATURE_EXTRACTION",
+                    target_modules=adapter,
+                    r=32,
+                    lora_alpha=32.0,
+                    lora_dropout=0.05,
+                    init_lora_weights="gaussian",
+                )
+                self.wavlm = LoraModel(self.wavlm, config, "lora-adapter")
 
     @property
     def dimension(self) -> int:

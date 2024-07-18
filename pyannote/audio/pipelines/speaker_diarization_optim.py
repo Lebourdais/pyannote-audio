@@ -27,12 +27,12 @@ import itertools
 import math
 import textwrap
 import warnings
-from typing import Callable, Optional, Text, Tuple, Union
+from typing import Callable, Optional, Text, Union
 
 import numpy as np
 import torch
 from einops import rearrange
-from pyannote.core import Annotation, SlidingWindow, SlidingWindowFeature
+from pyannote.core import Annotation, SlidingWindowFeature
 from pyannote.metrics.diarization import GreedyDiarizationErrorRate
 from pyannote.pipeline.parameter import ParamDict, Uniform
 
@@ -55,13 +55,13 @@ def batchify(iterable, batch_size: int = 32, fillvalue=None):
     return itertools.zip_longest(*args, fillvalue=fillvalue)
 
 
-class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
+class SpeakerDiarizationOptim(SpeakerDiarizationMixin, Pipeline):
     """Speaker diarization pipeline
 
     Parameters
     ----------
     segmentation : Model, str, or dict, optional
-        Pretrained segmentation model and separation model.
+        Pretrained segmentation model. Defaults to "pyannote/segmentation@2022.07".
         See pyannote.audio.pipelines.utils.get_model for supported format.
     segmentation_step: float, optional
         The segmentation model is applied on a window sliding over the whole audio file.
@@ -91,10 +91,19 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
 
     Usage
     -----
-    >>> pipeline = SpeakerDiarization()
-    >>> diarization, separation = pipeline("/path/to/audio.wav")
-    >>> diarization, separation = pipeline("/path/to/audio.wav", num_speakers=4)
-    >>> diarization, separation = pipeline("/path/to/audio.wav", min_speakers=2, max_speakers=10)
+    # perform (unconstrained) diarization
+    >>> diarization = pipeline("/path/to/audio.wav")
+
+    # perform diarization, targetting exactly 4 speakers
+    >>> diarization = pipeline("/path/to/audio.wav", num_speakers=4)
+
+    # perform diarization, with at least 2 speakers and at most 10 speakers
+    >>> diarization = pipeline("/path/to/audio.wav", min_speakers=2, max_speakers=10)
+
+    # perform diarization and get one representative embedding per speaker
+    >>> diarization, embeddings = pipeline("/path/to/audio.wav", return_embeddings=True)
+    >>> for s, speaker in enumerate(diarization.labels()):
+    ...     # embeddings[s] is the embedding of speaker `speaker`
 
     Hyper-parameters
     ----------------
@@ -105,8 +114,8 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
 
     def __init__(
         self,
-        segmentation: PipelineModel = None,
-        segmentation_step: float = 0.1,  # Will make AMI crash
+        segmentation: PipelineModel = "pyannote/segmentation@2022.07",
+        segmentation_step: float = 0.1,
         embedding: PipelineModel = "speechbrain/spkrec-ecapa-voxceleb@5c0be3875fda05e81f3c004ed8c7c06be308de1e",
         embedding_exclude_overlap: bool = False,
         clustering: str = "AgglomerativeClustering",
@@ -114,10 +123,9 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
         segmentation_batch_size: int = 1,
         der_variant: Optional[dict] = None,
         use_auth_token: Union[Text, None] = None,
-        return_separation=True,
     ):
         super().__init__()
-        self.return_separation = return_separation
+
         self.segmentation_model = segmentation
         model: Model = get_model(segmentation, use_auth_token=use_auth_token)
 
@@ -130,10 +138,7 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
         self.klustering = clustering
 
         self.der_variant = der_variant or {"collar": 0.0, "skip_overlap": False}
-        self.total_parameters = sum(param.numel() for param in model.parameters())
-        self.trainable_parameters = sum(
-            p.numel() for p in model.parameters() if p.requires_grad
-        )
+
         segmentation_duration = model.specifications[0].duration
         self._segmentation = Inference(
             model,
@@ -176,13 +181,6 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
     def segmentation_batch_size(self) -> int:
         return self._segmentation.batch_size
 
-    @property
-    def number_parameters(self) -> dict:
-        return {
-            "total_parameters": self.total_parameters,
-            "trainable_parameters": self.trainable_parameters,
-        }
-
     @segmentation_batch_size.setter
     def segmentation_batch_size(self, batch_size: int):
         self._segmentation.batch_size = batch_size
@@ -200,9 +198,7 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
     def CACHED_SEGMENTATION(self):
         return "training_cache/segmentation"
 
-    def get_segmentations(
-        self, file, hook=None
-    ) -> Tuple[SlidingWindowFeature, SlidingWindowFeature]:
+    def get_segmentations(self, file, hook=None) -> SlidingWindowFeature:
         """Apply segmentation model
 
         Parameter
@@ -213,31 +209,21 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
         Returns
         -------
         segmentations : (num_chunks, num_frames, num_speakers) SlidingWindowFeature
-        separations : (num_chunks, num_samples, num_speakers) SlidingWindowFeature
         """
 
         if hook is not None:
             hook = functools.partial(hook, "segmentation", None)
-        if not self.return_separation:
-            if self.training:
-                if self.CACHED_SEGMENTATION in file:
-                    segmentations = file[self.CACHED_SEGMENTATION]
-                else:
-                    segmentations = self._segmentation(file, hook=hook)
-                    file[self.CACHED_SEGMENTATION] = segmentations
-            else:
-                segmentations = self._segmentation(file, hook=hook)
-            return segmentations
+
         if self.training:
             if self.CACHED_SEGMENTATION in file:
-                segmentations, separations = file[self.CACHED_SEGMENTATION]
+                segmentations = file[self.CACHED_SEGMENTATION]
             else:
-                segmentations, separations = self._segmentation(file, hook=hook)
+                segmentations = self._segmentation(file, hook=hook)
                 file[self.CACHED_SEGMENTATION] = segmentations
         else:
-            segmentations, separations = self._segmentation(file, hook=hook)
+            segmentations: SlidingWindowFeature = self._segmentation(file, hook=hook)
 
-        return segmentations, separations
+        return segmentations
 
     def get_embeddings(
         self,
@@ -321,19 +307,17 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
                 )
                 # waveform: (1, num_samples) torch.Tensor
 
-                # speaker_activation_with_context may contain NaN (in case of partial stitching)
+                # mask may contain NaN (in case of partial stitching)
                 masks = np.nan_to_num(masks, nan=0.0).astype(np.float32)
                 clean_masks = np.nan_to_num(clean_masks, nan=0.0).astype(np.float32)
 
-                for speaker_activation_with_context, clean_mask in zip(
-                    masks.T, clean_masks.T
-                ):
-                    # speaker_activation_with_context: (num_frames, ) np.ndarray
+                for mask, clean_mask in zip(masks.T, clean_masks.T):
+                    # mask: (num_frames, ) np.ndarray
 
                     if np.sum(clean_mask) > min_num_frames:
                         used_mask = clean_mask
                     else:
-                        used_mask = speaker_activation_with_context
+                        used_mask = mask
 
                     yield waveform[None], torch.from_numpy(used_mask)[None]
                     # w: (1, 1, num_samples) torch.Tensor
@@ -437,8 +421,8 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
         clustered_segmentations = SlidingWindowFeature(
             clustered_segmentations, segmentations.sliding_window
         )
-        return clustered_segmentations
-        # return self.to_diarization(clustered_segmentations, count)
+
+        return self.to_diarization(clustered_segmentations, count)
 
     def apply(
         self,
@@ -448,8 +432,6 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
         max_speakers: Optional[int] = None,
         return_embeddings: bool = False,
         hook: Optional[Callable] = None,
-        zero: bool = False,
-        context_size_seconds: float = 0,
     ) -> Annotation:
         """Apply speaker diarization
 
@@ -473,23 +455,17 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
             Time-consuming steps call `hook` multiple times with the same `step_name`
             and additional `completed` and `total` keyword arguments usable to track
             progress of current step.
-        zero : bool, optional
-            Zero-out sources when speaker is inactive according to diarization.
-        context_size_seconds : float, optional
-            Number of seconds to keep around active speaker regions in separated
-            sources. Useful for downstream ASR. Defaults to 0.
 
         Returns
         -------
         diarization : Annotation
             Speaker diarization
-        sources : SlidingWindowFeature
-            Separated sources
         embeddings : np.array, optional
             Representative speaker embeddings such that `embeddings[i]` is the
             speaker embedding for i-th speaker in diarization.labels().
             Only returned when `return_embeddings` is True.
         """
+
         # setup hook (e.g. for debugging purposes)
         hook = self.setup_hook(file, hook=hook)
 
@@ -499,18 +475,16 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
             max_speakers=max_speakers,
         )
 
-        segmentations, separations = self.get_segmentations(file, hook=hook)
+        segmentations = self.get_segmentations(file, hook=hook)
         hook("segmentation", segmentations)
         #   shape: (num_chunks, num_frames, local_num_speakers)
-        hook("separations", separations)
-        #   shape: (num_chunks, nums_samples, local_num_speakers)
 
         # binarize segmentation
         if self._segmentation.model.specifications[0].powerset:
             binarized_segmentations = segmentations
         else:
             binarized_segmentations: SlidingWindowFeature = binarize(
-                segmentations,
+                segmentations[0],
                 onset=self.segmentation.threshold,
                 initial_state=False,
             )
@@ -522,7 +496,6 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
             warm_up=(0.0, 0.0),
         )
         hook("speaker_counting", count)
-
         #   shape: (num_frames, 1)
         #   dtype: int
 
@@ -530,9 +503,9 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
         if np.nanmax(count.data) == 0.0:
             diarization = Annotation(uri=file["uri"])
             if return_embeddings:
-                return diarization, None, np.zeros((0, self._embedding.dimension))
+                return diarization, np.zeros((0, self._embedding.dimension))
 
-            return diarization, None
+            return diarization
 
         if self.klustering == "OracleClustering" and not return_embeddings:
             embeddings = None
@@ -592,76 +565,11 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
 
         hard_clusters[inactive_speakers] = -2
         discrete_diarization = self.reconstruct(
-            segmentations,
+            segmentations[0],
             hard_clusters,
             count,
         )
-        discrete_diarization = self.to_diarization(discrete_diarization, count)
         hook("discrete_diarization", discrete_diarization)
-        clustered_separations = self.reconstruct(separations, hard_clusters, count)
-        hook("clustered_separation", clustered_separations)
-        frame_duration = separations.sliding_window.duration / separations.data.shape[1]
-        frames = SlidingWindow(step=frame_duration, duration=2 * frame_duration)
-        sources = Inference.aggregate(
-            clustered_separations,
-            frames=frames,
-            hamming=True,
-            missing=0.0,
-            skip_average=True,
-        )
-        hook("source_aggregation", sources)
-        # zero-out sources when speaker is inactive
-        # WARNING: this should be rewritten to avoid huge memory consumption
-        if zero:
-            context_size_frames = int(
-                self._segmentation.model.num_frames(
-                    context_size_seconds * self._audio.sample_rate
-                )
-            )
-            if context_size_frames > 0:
-                for i in range(discrete_diarization.data.shape[1]):
-                    speaker_activation = discrete_diarization.data.T[i]
-                    non_silent = np.where(speaker_activation != 0)[0]
-                    remaining_gaps = np.where(
-                        np.diff(non_silent) > 2 * context_size_frames
-                    )[0]
-                    remaining_zeros = [
-                        np.arange(
-                            non_silent[gap] + context_size_frames,
-                            non_silent[gap + 1] - context_size_frames,
-                        )
-                        for gap in remaining_gaps
-                    ]
-                    # edge cases of long silent regions in beginning or end of audio
-                    if non_silent[0] > context_size_frames:
-                        remaining_zeros = [
-                            np.arange(0, non_silent[0] - context_size_frames)
-                        ] + remaining_zeros
-                    if (
-                        non_silent[-1]
-                        < speaker_activation.shape[0] - context_size_frames
-                    ):
-                        remaining_zeros = remaining_zeros + [
-                            np.arange(
-                                non_silent[-1] + context_size_frames,
-                                speaker_activation.shape[0],
-                            )
-                        ]
-
-                    speaker_activation_with_context = np.ones(
-                        len(speaker_activation), dtype=float
-                    )
-
-                    speaker_activation_with_context[
-                        np.concatenate(remaining_zeros)
-                    ] = 0.0
-
-                    discrete_diarization.data.T[i] = speaker_activation_with_context
-            num_sources = sources.data.shape[1]
-            sources.data = (
-                sources.data * discrete_diarization.align(sources).data[:, :num_sources]
-            )
-            hook("leakage_removal", sources)
 
         # convert to continuous diarization
         diarization = self.to_annotation(
@@ -700,14 +608,13 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
         # at this point, `diarization` speaker labels are strings (or mix of
         # strings and integers when reference is available and some hypothesis
         # speakers are not present in the reference)
-        if not self.return_separation:
-            return diarization
+
         if not return_embeddings:
-            return diarization, sources
+            return diarization
 
         # this can happen when we use OracleClustering
         if centroids is None:
-            return diarization, sources, None
+            return diarization, None
 
         # The number of centroids may be smaller than the number of speakers
         # in the annotation. This can happen if the number of active speakers
@@ -726,7 +633,7 @@ class JointSpeakerDiarizationAndSeparation(SpeakerDiarizationMixin, Pipeline):
             [inverse_mapping[label] for label in diarization.labels()]
         ]
 
-        return diarization, sources, centroids
+        return diarization, centroids
 
     def get_metric(self) -> GreedyDiarizationErrorRate:
         return GreedyDiarizationErrorRate(**self.der_variant)

@@ -60,6 +60,7 @@ def binary_cross_entropy(
     prediction: torch.Tensor,
     target: torch.Tensor,
     weight: Optional[torch.Tensor] = None,
+    reduction: str = "mean",
 ) -> torch.Tensor:
     """Frame-weighted binary cross entropy
 
@@ -72,7 +73,7 @@ def binary_cross_entropy(
         or (batch_size, num_frames, num_classes) for multi-label classification.
     weight : (batch_size, num_frames, 1) torch.Tensor, optional
         Frame weight with shape (batch_size, num_frames, 1).
-
+    reduction: Reduction of the loss, by default mean, useful to keep all losses per batch.
     Returns
     -------
     loss : torch.Tensor
@@ -83,14 +84,17 @@ def binary_cross_entropy(
         target = target.unsqueeze(dim=2)
 
     if weight is None:
-        return F.binary_cross_entropy(prediction, target.float())
+        return F.binary_cross_entropy(prediction, target.float(), reduction=reduction)
 
     else:
         # interpolate weight
         weight = interpolate(target, weight=weight)
 
         return F.binary_cross_entropy(
-            prediction, target.float(), weight=weight.expand(target.shape)
+            prediction,
+            target.float(),
+            weight=weight.expand(target.shape),
+            reduction=reduction,
         )
 
 

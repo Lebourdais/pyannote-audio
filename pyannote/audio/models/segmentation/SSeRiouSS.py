@@ -91,7 +91,7 @@ class SSeRiouSS(Model):
         sample_rate: int = 16000,
         num_channels: int = 1,
         task: Optional[Task] = None,
-        finetune_wavlm=None,
+        finetune_wavlm={"type": "average"},
         gradient_clip_val: float = 5.0,
     ):
 
@@ -101,10 +101,10 @@ class SSeRiouSS(Model):
 
         if isinstance(ssl, str):
             # `ssl` is one of the pretrained model in huggingface
-            self.ssl = AutoModel.from_pretrained(ssl)
+            self.ssl = AutoModel.from_pretrained(ssl, local_files_only=True)
             model_dim = self.ssl.feature_projection.projection.out_features
-            # model_num_layers = self.ssl.config.num_hidden_layers
-
+            model_num_layers = self.ssl.config.num_hidden_layers
+        self.use_last = True
         # the ssl should be freeze there for an accurate parameter counting
         if self.finetune_wavlm is None:
             for param in self.ssl.parameters():
@@ -125,6 +125,14 @@ class SSeRiouSS(Model):
                 init_lora_weights="gaussian",
             )
             self.ssl = LoraModel(self.ssl, config, "lora-adapter")
+        elif self.finetune_wavlm["type"] == "average":
+            self.use_last = False
+            for param in self.ssl.parameters():
+                param.requires_grad = False
+            self.weights = nn.Parameter(
+                data=torch.ones(model_num_layers), requires_grad=True
+            )
+
         else:
             self.automatic_optimization = False
 
@@ -231,22 +239,13 @@ class SSeRiouSS(Model):
             for conv_layer in self.ssl.feature_extractor.conv_layers:
                 num_frames = conv1d_num_frames(
                     num_frames,
-                    kernel_size=conv_layer.kernel_size,
-                    stride=conv_layer.stride,
-                    padding=conv_layer.conv.padding[0],
-                    dilation=conv_layer.conv.dilation[0],
-                )
-        except AttributeError as e:
-            print(e)
-            # wav2vec does not contains feature_extractor
-            for conv_layer in self.ssl.model.feature_extractor.conv_layers:
-                num_frames = conv1d_num_frames(
-                    num_frames,
                     kernel_size=conv_layer.conv.kernel_size[0],
                     stride=conv_layer.conv.stride[0],
                     padding=conv_layer.conv.padding[0],
                     dilation=conv_layer.conv.dilation[0],
                 )
+        except Exception as e:
+            print(e)
         return num_frames
 
     def receptive_field_size(self, num_frames: int = 1) -> int:
@@ -262,26 +261,19 @@ class SSeRiouSS(Model):
         receptive_field_size : int
             Receptive field size.
         """
+
+        receptive_field_size = num_frames
         try:
-            receptive_field_size = num_frames
             for conv_layer in reversed(self.ssl.feature_extractor.conv_layers):
-                receptive_field_size = conv1d_receptive_field_size(
-                    num_frames=receptive_field_size,
-                    kernel_size=conv_layer.kernel_size,
-                    stride=conv_layer.stride,
-                    dilation=conv_layer.conv.dilation[0],
-                )
-        except AttributeError as e:
-            print(e)
-            # print("marche")
-            # wav2vec does not contains feature_extractor
-            for conv_layer in reversed(self.ssl.model.feature_extractor.conv_layers):
+
                 receptive_field_size = conv1d_receptive_field_size(
                     num_frames=receptive_field_size,
                     kernel_size=conv_layer.conv.kernel_size[0],
                     stride=conv_layer.conv.stride[0],
                     dilation=conv_layer.conv.dilation[0],
                 )
+        except Exception as e:
+            print(e)
         return receptive_field_size
 
     def receptive_field_center(self, frame: int = 0) -> int:
@@ -300,17 +292,7 @@ class SSeRiouSS(Model):
         receptive_field_center = frame
         try:
             for conv_layer in reversed(self.ssl.feature_extractor.conv_layers):
-                receptive_field_center = conv1d_receptive_field_center(
-                    receptive_field_center,
-                    kernel_size=conv_layer.kernel_size,
-                    stride=conv_layer.stride,
-                    padding=conv_layer.conv.padding[0],
-                    dilation=conv_layer.conv.dilation[0],
-                )
-        except AttributeError as e:
-            print(e)
-            # wav2vec does not contains feature_extractor
-            for conv_layer in reversed(self.ssl.model.feature_extractor.conv_layers):
+                # print(f"{conv_layer.conv.kernel_size=},{conv_layer.conv.stride=},{conv_layer.conv.padding=},{conv_layer.conv.dilation=}")
                 receptive_field_center = conv1d_receptive_field_center(
                     receptive_field_center,
                     kernel_size=conv_layer.conv.kernel_size[0],
@@ -318,6 +300,8 @@ class SSeRiouSS(Model):
                     padding=conv_layer.conv.padding[0],
                     dilation=conv_layer.conv.dilation[0],
                 )
+        except Exception as e:
+            print(e)
         return receptive_field_center
 
     def forward(self, waveforms: torch.Tensor) -> torch.Tensor:
@@ -339,7 +323,12 @@ class SSeRiouSS(Model):
             with torch.no_grad():
                 outputs = self.ssl(waveforms.squeeze(1)).last_hidden_state
         else:
-            outputs = self.ssl(waveforms.squeeze(1)).last_hidden_state
+            if self.use_last:
+                with torch.no_grad():
+                    outputs = self.ssl(waveforms.squeeze(1)).hidden_states
+                outputs = torch.stack(outputs, dim=-1) @ F.softmax(self.weights, dim=0)
+            else:
+                outputs = self.ssl(waveforms.squeeze(1)).last_hidden_state
 
         # if num_layers is None:
         #     outputs = torch.stack(outputs, dim=-1) @ F.softmax(

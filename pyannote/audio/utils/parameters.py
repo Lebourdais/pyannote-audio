@@ -35,6 +35,7 @@ class Parameters:
         console=None,
         experiment=None,
         yaml_path=None,
+        opti_path=None,
     ):
         date = str(datetime.datetime.now().strftime("%Y%m%d%H%M%S"))
         DEFAULT_TRAIN_PARAMETERS = {
@@ -84,6 +85,7 @@ class Parameters:
         self.optimize_parameters = merge_dict(DEFAULT_OPTI_PARAMETERS, opti_params)
         self.eval_parameters = eval_params
         self.yaml_path = yaml_path
+        self.opti_path = opti_path
         signal.signal(signal.SIGUSR1, self.sig_handler)
 
     @classmethod
@@ -114,6 +116,7 @@ class Parameters:
         eval_param = cfg.get("evaluate", {})
         experiment = cfg.get("experiment", None)
         yaml_path = cfg.get("yaml_path", None)
+        opti_path = cfg.get("opti_path", None)
         return cls(
             train_params,
             opti_param,
@@ -121,7 +124,11 @@ class Parameters:
             console,
             experiment=experiment,
             yaml_path=yaml_path,
+            opti_path=opti_path,
         )
+
+    def set_lr(self, lr):
+        self.train_parameters["train"]["lr"] = lr
 
     def sig_handler(self, signum, frame):
         """
@@ -155,9 +162,43 @@ class Parameters:
                 "evaluate": self.eval_parameters,
                 "experiment": self.experiment_,
                 "yaml_path": self.yaml_path,
+                "opti_path": self.opti_path,
             }
             yaml.dump(out, yaml_out)
             self.console.print(f"Configuration saved at {self.yaml_path}")
+
+        with open(self.opti_path, "w") as opti_out:
+            opti_yml = {
+                "pipeline": {
+                    "name": "pyannote.audio.pipelines.SpeakerDiarizationOptim",  # Set the pipeline to use (here, we need the modified version of SpeakerDiarization that works with PixIT)
+                    "params": {
+                        "clustering": "AgglomerativeClustering",  # Set the clustering type (AgglomerativeClustering or OracleClustering)
+                        "embedding": "speechbrain/spkrec-ecapa-voxceleb",  # Set the embedding model (only ecapa tdnn allowed for the challenge)
+                        "embedding_batch_size": 16,
+                        "segmentation_batch_size": 16,
+                        "embedding_exclude_overlap": True,
+                        "segmentation": {
+                            "checkpoint": self.model.get(
+                                "best_ckpt", None
+                            ),  # The checkpoint of the PixIT model
+                            "params": self.train_parameters["model"].get(
+                                "inferences_params", None
+                            ),
+                        },
+                    },
+                },
+                "device": "cuda",
+                "preprocessors": {"audio": {"name": "pyannote.database.FileFinder"}},
+                "freeze": {
+                    "clustering": {
+                        "method": "centroid",
+                    },
+                    "segmentation": {
+                        "min_duration_off": 0.0,
+                    },
+                },
+            }
+            yaml.dump(opti_yml, opti_out)
 
     def set_augment(
         self,
@@ -279,14 +320,17 @@ class Parameters:
             print("Experiment already exists, pass force flag to bypass")
             return
         self.experiment_ = f"{name}_{self.train['date']}"
-        path = Path("results/" + self.experiment_ + "/models")
+        path = Path(f"results/{self.experiment_}/models")
         path.mkdir(parents=True, exist_ok=False)
-        path_eval = Path("results/" + self.experiment_ + "/eval/rttm")
+        path_eval = Path(f"results/{self.experiment_}/eval/rttm")
         path_eval.mkdir(parents=True, exist_ok=False)
-        path_eval_audio = Path("results/" + self.experiment_ + "/eval/audio")
+        path_eval_audio = Path(f"results/{self.experiment_}/eval/audio")
         path_eval_audio.mkdir(parents=True, exist_ok=False)
-        path_tb = Path("results/" + self.experiment_ + "/tb_logs")
+        path_tb = Path(f"results/{self.experiment_}/tb_logs")
         path_tb.mkdir(parents=True, exist_ok=False)
+        path_opti = Path(f"results/{self.experiment_}/optimize")
+        self.opti_path = f"results/{self.experiment_}/optimize/config.yml"
+        path_opti.mkdir(parents=True, exist_ok=False)
 
     @property
     def experiment(self):

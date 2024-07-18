@@ -21,8 +21,16 @@
 # SOFTWARE.
 
 
+from .codec import CodecAugmentation
 from .conversation_aug import ConversationGeneration
 from .mix import MixSpeakerDiarization
 from .reverb_aug import ReverbAugmentation
+from .speed_perturbation import SpeedPerturbDiarization
 
-__all__ = ["MixSpeakerDiarization", "ConversationGeneration", "ReverbAugmentation"]
+__all__ = [
+    "MixSpeakerDiarization",
+    "CodecAugmentation",
+    "ConversationGeneration",
+    "ReverbAugmentation",
+    "SpeedPerturbDiarization",
+]
