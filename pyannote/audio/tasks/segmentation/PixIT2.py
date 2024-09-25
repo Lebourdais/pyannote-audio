@@ -86,7 +86,7 @@ class ValDataset(IterableDataset):
         return self.task.val__len__()
 
 
-class PixIT(SegmentationTask):
+class PixIT2(SegmentationTask):
     """Joint speaker diarization and speaker separation task based on PixIT
 
     Parameters
@@ -173,14 +173,12 @@ class PixIT(SegmentationTask):
         max_num_speakers: Optional[
             int
         ] = None,  # deprecated in favor of `max_speakers_per_chunk``
-        loss: Literal["bce", "mse"] = None,  # deprecated
         separation_loss_weight: float = 0.5,
         finetune_wavlm: bool = True,
         accumulate_gradient=1,
         n_opti=2,
         loss_mode="standard",
         loss_ckpt_path=None,
-        loss_array=False,
     ):
         super().__init__(
             protocol,
@@ -195,7 +193,6 @@ class PixIT(SegmentationTask):
 
         self.n_opti = n_opti
         self.loss_ckpt_path = loss_ckpt_path
-        self.loss_array = loss_array
         self.loss_mode = loss_mode
         self.batch_norm = None
         if "perm" in self.loss_mode:
@@ -480,6 +477,7 @@ class PixIT(SegmentationTask):
         metadata = self.prepared_data["audio-metadata"][file_id]
         sample["meta"] = {key: metadata[key] for key in metadata.dtype.names}
         sample["meta"]["file"] = file_id
+        sample["oracle"] = torch.rand() > 0.5
 
         return sample
 

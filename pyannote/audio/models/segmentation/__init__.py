@@ -23,7 +23,8 @@
 from .PyanNet import PyanNet
 from .SSeRiouSS import SSeRiouSS
 from .ToTaToNet import ToTaToNet
+from .ToTaToNet2 import ToTaToNet2
 
 # from .ToTaToNet_dup import ToTaToNet
 
-__all__ = ["PyanNet", "SSeRiouSS", "ToTaToNet"]
+__all__ = ["PyanNet", "SSeRiouSS", "ToTaToNet"], "ToTaToNet2"

@@ -56,9 +56,19 @@ class SSeRiouSS(Model):
         Number of channels. Defaults to mono (1).
     wav2vec: dict or str, optional
         Defaults to "WAVLM_BASE".
-    wav2vec_layer: int, optional
-        Index of layer to use as input to the LSTM.
-        Defaults (-1) to use average of all layers (with learnable weights).
+    finetune: dict, optional
+        Select a way of using the self supervised extractor
+        contains a key "type" and other optional keys depending on the type
+        Existing types for now:
+            - average (default): weighted average of every layers with learnable weights
+            - last: get the last output of a frozen extractor
+            - lora: adapt the extractor with LoRA (https://github.com/microsoft/LoRA) and get the last output
+                - adapter: custom layers to adapt to LoRA, default to ["q_proj", "v_proj"]
+                - r: Rank of Decomposition, default to 32
+                - lora_alpha: alpha for lora scaling, default to 32.0
+                - lora_dropout: probability of dropout for adapters, default to 0.05
+                - init_lora_weight: type of lora to use, default to gaussian
+
     lstm : dict, optional
         Keyword arguments passed to the LSTM layer.
         Defaults to {"hidden_size": 128, "num_layers": 4, "bidirectional": True},
@@ -69,6 +79,12 @@ class SSeRiouSS(Model):
         Keyword arugments used to initialize linear layers
         Defaults to {"hidden_size": 128, "num_layers": 2},
         i.e. two linear layers with 128 units each.
+    wav2vec_layer: int, optional
+        Deprecated in favor of finetune
+        Index of layer to use as input to the LSTM.
+        Defaults (-1) to use average of all layers (with learnable weights).
+    finetune_wavlm: dict
+        changing name to finetune
     """
 
     WAV2VEC_DEFAULTS = "WAVLM_BASE"
@@ -85,19 +101,21 @@ class SSeRiouSS(Model):
     def __init__(
         self,
         ssl: Union[dict, str] = None,
-        wav2vec_layer: int = -1,
+        finetune={"type": "average"},
         lstm: Optional[dict] = None,
         linear: Optional[dict] = None,
         sample_rate: int = 16000,
         num_channels: int = 1,
         task: Optional[Task] = None,
-        finetune_wavlm={"type": "average"},
         gradient_clip_val: float = 5.0,
+        wav2vec_layer: int = -1,  # Deprecated
+        finetune_wavlm=None,
     ):
 
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
         self.gradient_clip_val = gradient_clip_val
-        self.finetune_wavlm = finetune_wavlm
+
+        self.finetune = finetune if finetune_wavlm is None else finetune_wavlm
 
         if isinstance(ssl, str):
             # `ssl` is one of the pretrained model in huggingface
@@ -105,27 +123,44 @@ class SSeRiouSS(Model):
             model_dim = self.ssl.feature_projection.projection.out_features
             model_num_layers = self.ssl.config.num_hidden_layers
         self.use_last = True
+        if "dual_optimizer" in self.finetune:
+            self.automatic_optimization = False
         # the ssl should be freeze there for an accurate parameter counting
-        if self.finetune_wavlm is None:
+        if self.finetune["type"] == "last":
             for param in self.ssl.parameters():
                 param.requires_grad = False
-        elif self.finetune_wavlm["type"] == "lora":
-            if self.finetune_wavlm["dual_optimizer"]:
-                self.automatic_optimization = False
-            if "adapter" in self.finetune_wavlm:
-                adapter = self.finetune_wavlm["adapter"]
+        elif self.finetune["type"] == "lora":
+
+            if "adapter" in self.finetune:
+                adapter = self.finetune["adapter"]
             else:
                 adapter = ["q_proj", "v_proj"]
+            if "r" in self.finetune:
+                r = self.finetune["r"]
+            else:
+                r = 32
+            if "lora_alpha" in self.finetune:
+                lora_alpha = self.finetune["lora_alpha"]
+            else:
+                lora_alpha = 32.0
+            if "lora_dropout" in self.finetune:
+                lora_alpha = self.finetune["lora_dropout"]
+            else:
+                lora_dropout = 0.05
+            if "init_lora_weights" in self.finetune:
+                init_lora_weights = self.finetune["init_lora_weights"]
+            else:
+                init_lora_weights = "gaussian"
             config = LoraConfig(
                 task_type="FEATURE_EXTRACTION",
                 target_modules=adapter,
-                r=32,
-                lora_alpha=32.0,
-                lora_dropout=0.05,
-                init_lora_weights="gaussian",
+                r=r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                init_lora_weights=init_lora_weights,
             )
             self.ssl = LoraModel(self.ssl, config, "lora-adapter")
-        elif self.finetune_wavlm["type"] == "average":
+        elif self.finetune["type"] == "average":
             self.use_last = False
             for param in self.ssl.parameters():
                 param.requires_grad = False
@@ -135,11 +170,6 @@ class SSeRiouSS(Model):
 
         else:
             self.automatic_optimization = False
-
-        # if wav2vec_layer < 0:
-        #     self.wav2vec_weights = nn.Parameter(
-        #         data=torch.ones(wav2vec_num_layers), requires_grad=True
-        #     )
 
         lstm = merge_dict(self.LSTM_DEFAULTS, lstm)
         lstm["batch_first"] = True
@@ -319,16 +349,13 @@ class SSeRiouSS(Model):
         # num_layers = (
         #     None if self.hparams.wav2vec_layer < 0 else self.hparams.wav2vec_layer
         # )
-        if not self.finetune_wavlm:
+        if self.finetune["type"] == "last":
             with torch.no_grad():
                 outputs = self.ssl(waveforms.squeeze(1)).last_hidden_state
         else:
-            if self.use_last:
-                with torch.no_grad():
-                    outputs = self.ssl(waveforms.squeeze(1)).hidden_states
-                outputs = torch.stack(outputs, dim=-1) @ F.softmax(self.weights, dim=0)
-            else:
-                outputs = self.ssl(waveforms.squeeze(1)).last_hidden_state
+            with torch.no_grad():
+                outputs = self.ssl(waveforms.squeeze(1)).hidden_states
+            outputs = torch.stack(outputs, dim=-1) @ F.softmax(self.weights, dim=0)
 
         # if num_layers is None:
         #     outputs = torch.stack(outputs, dim=-1) @ F.softmax(
