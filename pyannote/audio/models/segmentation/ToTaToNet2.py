@@ -140,6 +140,7 @@ class ToTaToNet2(Model):
         wavlm_version="microsoft/wavlm-large",
         gradient_clip_val: float = 5.0,
         sep_features=["wavlm", "filter", "diar"],
+        merge_lin=False,
         ca_dim=None,
     ):
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
@@ -156,18 +157,19 @@ class ToTaToNet2(Model):
         encoder_decoder = merge_dict(self.ENCODER_DECODER_DEFAULTS, encoder_decoder)
         diar = merge_dict(self.DIAR_DEFAULTS, diar)
         self.n_src = n_sources
+        self.merge_lin = merge_lin
         self.use_wavlm = features["use_wavlm"]
         self.save_hyperparameters(
             "features", "encoder_decoder", "lstm", "linear", "dprnn", "diar"
         )
         self.n_sources = n_sources
         self.wavlm_version = features["wavlm_version"]
-        if encoder_decoder["fb_name"] == "free":
-            n_feats_out = encoder_decoder["n_filters"]
-        elif encoder_decoder["fb_name"] == "stft":
-            n_feats_out = int(2 * (encoder_decoder["n_filters"] / 2 + 1))
-        else:
-            raise ValueError("Filterbank type not recognized.")
+        # if encoder_decoder["fb_name"] == "free":
+        #     n_feats_out = encoder_decoder["n_filters"]
+        # elif encoder_decoder["fb_name"] == "stft":
+        #     n_feats_out = int(2 * (encoder_decoder["n_filters"] / 2 + 1))
+        # else:
+        #     raise ValueError("Filterbank type not recognized.")
         self.encoder, self.decoder = make_enc_dec(
             sample_rate=sample_rate, **self.hparams.encoder_decoder
         )
@@ -185,23 +187,42 @@ class ToTaToNet2(Model):
         self.wavlm_scaling = int(downsampling_factor / encoder_decoder["stride"])
         del lstm["monolithic"]
         multi_layer_lstm = dict(lstm)
-        embedding_dim = 0
-        print(self.sep_features)
-        if "wavlm" in self.sep_features:
-            embedding_dim += 1024
-        if "filter" in self.sep_features:
-            embedding_dim += 64
-        if "diar" in self.sep_features:
-            embedding_dim += 64
+        if self.use_ca:
+            print("Using Cross Attention")
+            self.ca = CrossAttention(ca_dim)
+            embedding_dim = ca_dim
+        else:
+            embedding_dim = 0
+            print(self.sep_features)
+            if "wavlm" in self.sep_features:
+                embedding_dim += 1024
+            if "filter" in self.sep_features:
+                embedding_dim += 64
+            if "diar" in self.sep_features:
+                embedding_dim += 64
+            if "softmax_diar" in self.sep_features:
+                embedding_dim += n_sources
+            if self.merge_lin:
+                print(
+                    "Merging the features using a linear layer without bias (for feature importance analysis)"
+                )
+                self.merging_layer = nn.Linear(embedding_dim, embedding_dim, bias=False)
         # embedding_dim = 128
         self.diar_base = nn.LSTM(1024, **multi_layer_lstm)
         linear_input_features = lstm["hidden_size"] * (
             2 if lstm["bidirectional"] else 1
         )
-
-        # self.compress_wavlm = nn.Sequential(Transpose(2,1),nn.Linear(1024,int(embedding_dim//2)),nn.LeakyReLU(),Transpose(2,1))
-        # self.upsample_diar = nn.Sequential(nn.Linear(64,embedding_dim),nn.LeakyReLU())
-        # self.merging = CrossAttention(embedding_dim) # Cross_attention
+        if self.use_ca:
+            self.compress_wavlm = nn.Sequential(
+                Transpose(2, 1),
+                nn.Linear(1024, int(embedding_dim // 2)),
+                nn.LeakyReLU(),
+                Transpose(2, 1),
+            )
+            self.upsample_diar = nn.Sequential(
+                nn.Linear(64, embedding_dim), nn.LeakyReLU()
+            )
+            self.merging = CrossAttention(embedding_dim)  # Cross_attention
 
         self.masker = DPRNN(
             embedding_dim,
@@ -419,21 +440,29 @@ class ToTaToNet2(Model):
             tf_rep,
         )
         # diar_output_upsampled = pad_x_to_y(self.upsample_diar(diar_repr).repeat_interleave(self.wavlm_scaling, dim=1).permute(0,2,1),tf_rep).permute(0,2,1)
-        sep_feats = []
-        if "wavlm" in self.sep_features:
-            sep_feats.append(wavlm_rep_upsampled)
-            # print("+",wavlm_rep_upsampled.shape)
-        if "filter" in self.sep_features:
-            sep_feats.append(tf_rep)
-            # print("+",tf_rep.shape)
-        if "diar" in self.sep_features:
-            # print("+",diar_output_upsampled.shape)
-            sep_feats.append(diar_output_upsampled)
-        merged_rep = torch.cat(sep_feats, dim=1)  # .permute(0,2,1)
-        # print(merged_rep.shape)
-        # wavlm_rep_upsampled = torch.cat((tf_rep, wavlm_rep_upsampled), dim=1)
-        # merged_rep = torch.cat((wavlm_rep_upsampled.permute(0,2,1),diar_output_upsampled),dim=-1).permute(0,2,1)
-        # merged_rep = self.merging(wavlm_rep_upsampled.permute(0,2,1),diar_output_upsampled).permute(0,2,1)
+        if not self.use_ca:
+            sep_feats = []
+            if "wavlm" in self.sep_features:
+                sep_feats.append(wavlm_rep_upsampled)
+                # print("+",wavlm_rep_upsampled.shape)
+            if "filter" in self.sep_features:
+                sep_feats.append(tf_rep)
+                # print("+",tf_rep.shape)
+            if "diar" in self.sep_features:
+                # print("+",diar_output_upsampled.shape)
+                sep_feats.append(diar_output_upsampled)
+            merged_rep = torch.cat(sep_feats, dim=1)  # .permute(0,2,1)
+            if self.merge_lin:
+                merged_rep = self.merging_layer(merged_rep)
+        else:
+            # print(merged_rep.shape)
+            wavlm_rep_upsampled = torch.cat((tf_rep, wavlm_rep_upsampled), dim=1)
+            merged_rep = torch.cat(
+                (wavlm_rep_upsampled.permute(0, 2, 1), diar_output_upsampled), dim=-1
+            ).permute(0, 2, 1)
+            merged_rep = self.merging(
+                wavlm_rep_upsampled.permute(0, 2, 1), diar_output_upsampled
+            ).permute(0, 2, 1)
 
         masks = self.masker(merged_rep)
         masked_tf_rep = masks * tf_rep.unsqueeze(1)
