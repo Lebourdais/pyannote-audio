@@ -435,10 +435,16 @@ class ToTaToNet2(Model):
         diar_output, diar_repr = self.diarization_branch(wavlm_rep)
 
         # print(f"{diar_repr.shape=}")
-        diar_output_upsampled = pad_x_to_y(
-            diar_repr.repeat_interleave(self.wavlm_scaling, dim=1).permute(0, 2, 1),
-            tf_rep,
-        )
+        if "diar" in self.sep_features:
+            diar_repr_upsampled = pad_x_to_y(
+                diar_repr.repeat_interleave(self.wavlm_scaling, dim=1).permute(0, 2, 1),
+                tf_rep,
+            )
+        if "softmax_diar" in self.sep_features:
+            diar_output_upsampled = pad_x_to_y(
+                diar_output.repeat_interleave(self.wavlm_scaling, dim=-1),
+                tf_rep,
+            )
         # diar_output_upsampled = pad_x_to_y(self.upsample_diar(diar_repr).repeat_interleave(self.wavlm_scaling, dim=1).permute(0,2,1),tf_rep).permute(0,2,1)
         if not self.use_ca:
             sep_feats = []
@@ -450,6 +456,8 @@ class ToTaToNet2(Model):
                 # print("+",tf_rep.shape)
             if "diar" in self.sep_features:
                 # print("+",diar_output_upsampled.shape)
+                sep_feats.append(diar_repr_upsampled)
+            if "softmax_diar" in self.sep_features:
                 sep_feats.append(diar_output_upsampled)
             merged_rep = torch.cat(sep_feats, dim=1)  # .permute(0,2,1)
             if self.merge_lin:
@@ -470,7 +478,7 @@ class ToTaToNet2(Model):
         # assert not torch.isnan(decoded_sources).any(), "Decoder output is NaN"
         decoded_sources = pad_x_to_y(decoded_sources, waveforms)
         decoded_sources = decoded_sources.transpose(1, 2)
-        outputs = torch.flatten(masked_tf_rep, start_dim=0, end_dim=1)
+        # outputs = torch.flatten(masked_tf_rep, start_dim=0, end_dim=1)
         # shape (batch * nsrc, nfilters, nframes)
         # outputs = self.average_pool()
         # assert not torch.isnan(outputs).any(), "Pooling output is NaN"
