@@ -1036,16 +1036,19 @@ class PixIT2(SegmentationTask):
                 permutated_diarization, target, weight=None, reduction="none"
             )
             print(permutated_diarization.shape)
+            mom_diarization = permutated_diarization[bsz:]
             seg_loss = seg_loss.mean()
+            # batch, length, speakers
             single_sources_mask = torch.stack(
                 [
                     (
-                        (permutated_diarization[:, s, :] == 1)
-                        * (permutated_diarization.sum(axis=2) == 1)
+                        (mom_diarization[:, :, s] == 1)
+                        * (mom_diarization.sum(axis=2) == 1)
                     )
                     for s in range(self.max_speakers_per_chunk)
                 ]
             )
+            # Get an alignment between single speaker sources and target sources for the same time stamps
             target_source = mom
             separation_loss_align_acc = []
             for s in range(self.max_speakers_per_chunk):
