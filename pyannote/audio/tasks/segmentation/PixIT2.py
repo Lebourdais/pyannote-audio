@@ -33,6 +33,7 @@ import numpy as np
 import torch
 import torch.nn.functional
 from asteroid.losses import MixITLossWrapper, multisrc_neg_sisdr
+from asteroid.utils.torch_utils import pad_x_to_y
 from matplotlib import pyplot as plt
 from pyannote.core import Segment, SlidingWindowFeature
 from pyannote.database.protocol import SpeakerDiarizationProtocol
@@ -198,51 +199,6 @@ class PixIT2(SegmentationTask):
         self.loss_array = loss_array
         self.loss_mode = loss_mode
         self.batch_norm = None
-        if "perm" in self.loss_mode:
-            if self.loss_mode == "perm_custom_bn":
-                self.batch_norm = BatchNorm(max_speakers_per_chunk)
-                # print(f"{self.optimizer.param_groups=}")
-                # optimizer.param_groups.append({'params': extra_params })
-                if self.loss_ckpt_path is not None:
-                    batch_norm_ckpt = f"{loss_ckpt_path}/batch_norm_custom.ckpt"
-                    if os.path.isfile(batch_norm_ckpt):
-                        print(f"Loading batch_norm from {loss_ckpt_path}")
-                        self.batch_norm.load_state_dict(torch.load(batch_norm_ckpt))
-            else:
-                self.batch_norm = torch.nn.BatchNorm1d(max_speakers_per_chunk)
-                # with torch.no_grad():
-                #    self.batch_norm.bias.fill_(1.)
-                if self.loss_ckpt_path is not None:
-                    batch_norm_ckpt = f"{loss_ckpt_path}/batch_norm.ckpt"
-                    if os.path.isfile(batch_norm_ckpt):
-                        print(f"Loading batch_norm from {loss_ckpt_path}")
-                        self.batch_norm.load_state_dict(torch.load(batch_norm_ckpt))
-            self.batch_norm.cuda()
-        if self.loss_mode == "perm_epoch":
-
-            self.alpha = 1
-        if "train" in self.loss_mode:
-
-            loss, alpha = self.loss_mode.split(":")
-            self.selection = torch.nn.Sequential(
-                torch.nn.Linear(max_speakers_per_chunk, max_speakers_per_chunk),
-                torch.nn.Sigmoid(),
-            )
-            self.projection = torch.nn.Sequential(
-                torch.nn.Linear(max_speakers_per_chunk, 2),
-                torch.nn.Softmax(),
-                torch.nn.Sigmoid(),
-            )
-
-            self.M = torch.nn.Sequential(
-                self.selection, Transpose(-1, -2), self.projection, Transpose(-1, -2)
-            ).cuda()
-            M_ckpt = f"{loss_ckpt_path}/M.ckpt"
-            if os.path.isfile(M_ckpt):
-                print(f"Loading Transformation from {loss_ckpt_path}")
-                self.M.load_state_dict(torch.load(M_ckpt))
-            self.kld = torch.nn.KLDivLoss(reduce="batchmean")
-            self.alpha = float(alpha)
         if not isinstance(protocol, SpeakerDiarizationProtocol):
             raise ValueError(
                 "SpeakerDiarization task requires a SpeakerDiarizationProtocol."
@@ -1036,7 +992,11 @@ class PixIT2(SegmentationTask):
                 permutated_diarization, target, weight=None, reduction="none"
             )
             print(permutated_diarization.shape)
-            mom_diarization = permutated_diarization[bsz:]
+            scale = mom_sources.shape[1] // permutated_diarization.shape[1]
+            mom_diarization = pad_x_to_y(
+                permutated_diarization[bsz:].repeat_interleave(scale, dim=-1),
+                mom_sources,
+            )
             seg_loss = seg_loss.mean()
             # batch, length, speakers
             single_sources_mask = torch.stack(
@@ -1049,13 +1009,21 @@ class PixIT2(SegmentationTask):
                 ]
             )
             # Get an alignment between single speaker sources and target sources for the same time stamps
+            batch_mom = mom.shape[0]
+            aligned_sources = []
             target_source = mom
-            separation_loss_align_acc = []
             for s in range(self.max_speakers_per_chunk):
-                single_pred = mom_sources[single_sources_mask[s]]
-                single_target = target_source[single_sources_mask[s]]
+                for b in range(batch_mom):
+                    single_pred = mom_sources[single_sources_mask[s]][b]
+                    single_target = target_source[single_sources_mask[s]][b]
+                    aligned_sources.append((single_pred, single_target))
+
+            # Calculate separation loss for aligned sources
+            separation_loss_align_acc = []
+            for single_pred, single_target in aligned_sources:
                 tmp_loss = multisrc_neg_sisdr(single_pred, single_target)
                 separation_loss_align_acc.append(tmp_loss)
+
             separation_loss_mixit = self.mixit_loss(
                 mom_sources.transpose(1, 2), torch.stack((mix1, mix2)).transpose(0, 1)
             ).mean()
