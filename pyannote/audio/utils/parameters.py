@@ -182,7 +182,7 @@ class Parameters:
                                 "best_ckpt", None
                             ),  # The checkpoint of the PixIT model
                             "params": self.train_parameters["model"].get(
-                                "inferences_params", None
+                                "inference_params", None
                             ),
                         },
                     },

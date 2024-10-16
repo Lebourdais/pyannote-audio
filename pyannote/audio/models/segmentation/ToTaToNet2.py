@@ -37,6 +37,7 @@ from pyannote.audio.core.model import Model
 from pyannote.audio.core.task import Task
 from pyannote.audio.models.blocks.CrossAttention import CrossAttention
 from pyannote.audio.utils.layer import Transpose
+from pyannote.audio.utils.log import torch_save
 from pyannote.audio.utils.params import merge_dict
 from pyannote.audio.utils.receptive_field import (
     conv1d_num_frames,
@@ -142,6 +143,7 @@ class ToTaToNet2(Model):
         sep_features=["wavlm", "filter", "diar"],
         merge_lin=False,
         ca_dim=None,
+        output_intermediate_layers = None,
     ):
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
         if ca_dim is not None:
@@ -149,6 +151,7 @@ class ToTaToNet2(Model):
         else:
             self.use_ca = False
         lstm = merge_dict(self.LSTM_DEFAULTS, lstm)
+        self.output_intermediate_layers = output_intermediate_layers
         lstm["batch_first"] = True
         features = merge_dict(self.FEATURES_DEFAULTS, features)
         self.finetune = finetune
@@ -193,7 +196,7 @@ class ToTaToNet2(Model):
             embedding_dim = ca_dim
         else:
             embedding_dim = 0
-            print(self.sep_features)
+            print("Features for separation branch",self.sep_features)
             if "wavlm" in self.sep_features:
                 embedding_dim += 1024
             if "filter" in self.sep_features:
@@ -202,6 +205,7 @@ class ToTaToNet2(Model):
                 embedding_dim += 64
             if "softmax_diar" in self.sep_features:
                 embedding_dim += n_sources
+            print(f"{embedding_dim=}")
             if self.merge_lin:
                 print(
                     "Merging the features using a linear layer without bias (for feature importance analysis)"
@@ -392,6 +396,8 @@ class ToTaToNet2(Model):
         for linear in self.linear:
             outputs = F.leaky_relu(linear(outputs))
         out = self.classifier(outputs)
+        if self.output_intermediate_layers is not None:
+            torch_save(out,self.output_intermediate_layers,"diar")
         out = out.reshape(bsz, self.n_sources, -1)
         return out, outputs
 
@@ -410,6 +416,8 @@ class ToTaToNet2(Model):
         assert not torch.isnan(waveforms).any(), "Waveform is NaN"
         bsz = waveforms.shape[0]
         tf_rep = self.encoder(waveforms)
+        if self.output_intermediate_layers is not None:
+            torch_save(tf_rep,self.output_intermediate_layers,"filters")
         # assert not torch.isnan(tf_rep).any(), f"Encoder is NaN : {tf_rep}"
 
         # Extraction of WavLM features
@@ -473,7 +481,10 @@ class ToTaToNet2(Model):
             ).permute(0, 2, 1)
 
         masks = self.masker(merged_rep)
+        if self.output_intermediate_layers is not None:
+            torch_save(masks,self.output_intermediate_layers,"masks")
         masked_tf_rep = masks * tf_rep.unsqueeze(1)
+        
         decoded_sources = self.decoder(masked_tf_rep)
         # assert not torch.isnan(decoded_sources).any(), "Decoder output is NaN"
         decoded_sources = pad_x_to_y(decoded_sources, waveforms)

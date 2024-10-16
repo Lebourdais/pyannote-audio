@@ -182,6 +182,9 @@ class PixIT2(SegmentationTask):
         loss_mode="standard",
         loss_ckpt_path=None,
         loss_array=False,
+        oracle_diar=True,
+        weight_align=0.5,
+        leakage_removal=False,
     ):
         super().__init__(
             protocol,
@@ -195,9 +198,11 @@ class PixIT2(SegmentationTask):
         )
 
         self.n_opti = n_opti
+        self.weight_align=weight_align
         self.loss_ckpt_path = loss_ckpt_path
         self.loss_array = loss_array
         self.loss_mode = loss_mode
+        self.leakage_removal = leakage_removal
         self.batch_norm = None
         if not isinstance(protocol, SpeakerDiarizationProtocol):
             raise ValueError(
@@ -228,6 +233,7 @@ class PixIT2(SegmentationTask):
         self.weigh_by_cardinality = weigh_by_cardinality
         self.balance = balance
         self.weight = weight
+        self.oracle_diar = oracle_diar
         self.separation_loss_weight = separation_loss_weight
         reduction = (
             "none"
@@ -986,37 +992,71 @@ class PixIT2(SegmentationTask):
                 mom_sources.transpose(1, 2), torch.stack((mix1, mix2)).transpose(0, 1)
             ).mean()
         elif self.loss_mode == "gss":
-            alpha = 0.5
+            alpha = self.weight_align
             # calculate an auxilliary reconstruction loss on the source with a single speaker active
             seg_loss = self.segmentation_loss(
                 permutated_diarization, target, weight=None, reduction="none"
             )
-            print(permutated_diarization.shape)
+            permutations = np.array(permutations)
+            permutated_sources_acc = []
+            for b in range(sources.shape[0]):
+                permutated_sources_acc.append(sources[b,:,permutations[b]])
+            permutated_sources = torch.stack(permutated_sources_acc)
+            # print(sources[0,:,0])
+            # print(permutated_sources[0,:,0])
             scale = mom_sources.shape[1] // permutated_diarization.shape[1]
-            mom_diarization = pad_x_to_y(
-                permutated_diarization[bsz:].repeat_interleave(scale, dim=-1),
-                mom_sources,
-            )
+            if self.oracle_diar:
+                diarization_up = pad_x_to_y(
+                    (target>0.5).int().repeat_interleave(scale, dim=1).permute(0,2,1),
+                    sources.permute(0,2,1)
+                ).permute(0,2,1)
+            else:
+                diarization_up = pad_x_to_y(
+                    (permutated_diarization>0.5).int().repeat_interleave(scale, dim=1).permute(0,2,1),
+                    sources.permute(0,2,1)
+                ).permute(0,2,1)
+
             seg_loss = seg_loss.mean()
             # batch, length, speakers
             single_sources_mask = torch.stack(
                 [
                     (
-                        (mom_diarization[:, :, s] == 1)
-                        * (mom_diarization.sum(axis=2) == 1)
+                        (diarization_up[:, :, s] == 1)
+                        & (diarization_up.sum(axis=2) == 1)
                     )
                     for s in range(self.max_speakers_per_chunk)
                 ]
             )
+            if self.leakage_removal:
+                no_source_mask = torch.stack(
+                    [
+                        (
+                            (diarization_up[:, :, s] == 0)
+                        )
+                        for s in range(self.max_speakers_per_chunk)
+                    ]
+                )
+            
             # Get an alignment between single speaker sources and target sources for the same time stamps
-            batch_mom = mom.shape[0]
+            batch_mom = sources.shape[0]
             aligned_sources = []
-            target_source = mom
+            target_source = torch.cat((mix1, mix2, mom), dim=0)
+            if self.leakage_removal:
+                no_spk_segs = []
             for s in range(self.max_speakers_per_chunk):
-                for b in range(batch_mom):
-                    single_pred = mom_sources[single_sources_mask[s]][b]
-                    single_target = target_source[single_sources_mask[s]][b]
-                    aligned_sources.append((single_pred, single_target))
+                
+                single_pred = permutated_sources[single_sources_mask[s]]
+                if self.leakage_removal:
+                    no_pred = permutated_sources[no_source_mask[s]]
+                    no_spk_segs.append(no_pred[:,s])
+                #print(target_source.shape)
+                single_target = torch.stack([target_source for _ in range(self.max_speakers_per_chunk)],axis=-1)[single_sources_mask[s]]
+                
+                if single_pred[:,s].sum() == 0 :
+                    continue
+                else:
+                    #print(f"Speaker {s} has a solo segment")
+                    aligned_sources.append((single_pred[:,s].unsqueeze(0).unsqueeze(0),single_target[:,s].unsqueeze(0).unsqueeze(0)))
 
             # Calculate separation loss for aligned sources
             separation_loss_align_acc = []
@@ -1024,15 +1064,55 @@ class PixIT2(SegmentationTask):
                 tmp_loss = multisrc_neg_sisdr(single_pred, single_target)
                 separation_loss_align_acc.append(tmp_loss)
 
+
+            
+
             separation_loss_mixit = self.mixit_loss(
                 mom_sources.transpose(1, 2), torch.stack((mix1, mix2)).transpose(0, 1)
             ).mean()
-            separation_loss_align = sum(separation_loss_align_acc) / len(
-                separation_loss_align_acc
-            )
-            separation_loss = (alpha * separation_loss_mixit) + (
-                (1 - alpha) * separation_loss_align
-            )
+            if len(separation_loss_align_acc) == 0:
+                separation_loss_align = separation_loss_mixit
+            else:
+                separation_loss_align = sum(separation_loss_align_acc) / len(
+                    separation_loss_align_acc
+                )
+                #print("Loss align used")
+                self.model.log(
+                    "loss/alignment",
+                    separation_loss_align,
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=True,
+                    logger=True,
+                )
+                self.model.log(
+                    "loss/mixit",
+                    separation_loss_mixit,
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=True,
+                    logger=True,
+                )
+            if self.leakage_removal:
+                leakage_removal_loss = torch.square(torch.concat(no_spk_segs)).sum()
+                self.model.log(
+                    "loss/leakage_removal",
+                    leakage_removal_loss,
+                    on_step=True,
+                    on_epoch=True,
+                    prog_bar=True,
+                    logger=True,
+                )
+                
+                separation_loss = ((1-alpha) * separation_loss_mixit) + (
+                    (alpha//2) * separation_loss_align
+                )+(
+                    (alpha//2) * leakage_removal_loss
+                )
+            else:
+                separation_loss = ((1-alpha) * separation_loss_mixit) + (
+                    (alpha) * separation_loss_align
+                )
 
         elif self.loss_mode == "inferred":
             raw_seg_loss = self.segmentation_loss(
@@ -1057,6 +1137,7 @@ class PixIT2(SegmentationTask):
             diarization,
             permutated_diarization,
             target,
+            separation_loss_mixit
         )
 
     def sigmoid(self, x, lam=1):
@@ -1240,6 +1321,7 @@ class PixIT2(SegmentationTask):
             diarization,
             permutated_diarization,
             target,
+            _,
         ) = self.common_step(batch, batch_idx)
         self.model.log(
             "loss/train/separation",
@@ -1333,6 +1415,7 @@ class PixIT2(SegmentationTask):
             diarization,
             permutated_diarization,
             target,
+            mixit,
         ) = self.common_step(batch, None)
         with torch.no_grad():
             middle_point = 0.25
@@ -1341,7 +1424,7 @@ class PixIT2(SegmentationTask):
             )  # SegLoss typically between 0.1 and 0.5, need a high slope
         self.model.log(
             "loss/val/separation",
-            separation_loss,
+            mixit,
             on_step=False,
             on_epoch=True,
             prog_bar=False,
@@ -1382,18 +1465,6 @@ class PixIT2(SegmentationTask):
             prog_bar=True,
             logger=True,
         )
-        if self.loss_mode == "perm_batch_norm":
-            torch.save(
-                self.batch_norm.state_dict(), f"{self.loss_ckpt_path}/batch_norm.ckpt"
-            )
-        elif self.loss_mode == "perm_custom_bn":
-            torch.save(
-                self.batch_norm.state_dict(),
-                f"{self.loss_ckpt_path}/batch_norm_custom.ckpt",
-            )
-        if "train" in self.loss_mode:
-            torch.save(self.M.state_dict(), f"{self.loss_ckpt_path}/M.ckpt")
-        # log first batch visualization every 2^n epochs.
         if (
             self.model.current_epoch == 0
             or math.log2(self.model.current_epoch) % 1 > 0
