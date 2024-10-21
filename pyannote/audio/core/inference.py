@@ -526,7 +526,7 @@ class Inference(BaseInference):
         warm_up: Tuple[float, float] = (0.0, 0.0),
         epsilon: float = 1e-12,
         hamming: bool = False,
-        missing: float = np.NaN,
+        missing: float = np.nan,
         skip_average: bool = False,
     ) -> SlidingWindowFeature:
         """Aggregation
@@ -616,7 +616,6 @@ class Inference(BaseInference):
             # mask ~ (num_frames_per_chunk, num_classes)-shaped np.ndarray
             mask = 1 - np.isnan(score)
             np.nan_to_num(score, copy=False, nan=0.0)
-
             start_frame = frames.closest_frame(chunk.start + 0.5 * frames.duration)
 
             aggregated_output[start_frame : start_frame + num_frames_per_chunk] += (

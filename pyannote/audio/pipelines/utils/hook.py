@@ -24,6 +24,7 @@ import time
 from copy import deepcopy
 from typing import Any, Mapping, Optional, Text
 
+import torch
 from rich.progress import (
     BarColumn,
     Progress,
@@ -75,6 +76,9 @@ class ArtifactHook:
         ):
             return
 
+        if isinstance(step_artifact, torch.Tensor):
+            step_artifact = step_artifact.numpy(force=True)
+
         file.setdefault(self.file_key, dict())[step_name] = deepcopy(step_artifact)
 
 
@@ -93,10 +97,14 @@ class ProgressHook:
        output = pipeline(file, hook=hook)
     """
 
-    def __init__(self, transient: bool = False):
+    def __init__(self, transient: bool = False, hidden: bool = False):
         self.transient = transient
+        self.hidden = hidden
 
     def __enter__(self):
+        if self.hidden:
+            return self
+
         self.progress = Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -108,7 +116,11 @@ class ProgressHook:
         return self
 
     def __exit__(self, *args):
+        if self.hidden:
+            return
+
         self.progress.stop()
+        return
 
     def __call__(
         self,
@@ -118,6 +130,9 @@ class ProgressHook:
         total: Optional[int] = None,
         completed: Optional[int] = None,
     ):
+        if self.hidden:
+            return
+
         if completed is None:
             completed = total = 1
 

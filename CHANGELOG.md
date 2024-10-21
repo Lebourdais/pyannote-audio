@@ -4,17 +4,80 @@
 
 ### New features
 
+- feat: add support for `k-means` clustering
+- feat: add `"hidden"` option to `ProgressHook`
+- feat: add `FilterByNumberOfSpeakers` protocol files filter
+
+### Fixes
+
+- fix: fix clipping issue in speech separation pipeline ([@joonaskalda](https://github.com/joonaskalda/))
+
+## Version 3.3.2 (2024-09-11)
+
+### Fixes
+
+- fix: (really) fix support for `numpy==2.x` ([@metal3d](https://github.com/metal3d/))
+- doc: fix `Pipeline` docstring ([@huisman](https://github.com/huisman/))
+
+## Version 3.3.1 (2024-06-19)
+
+### Breaking changes
+
+- setup: drop support for Python 3.8
+
+### Fixes
+
+- fix: fix support for `numpy==2.x` ([@ibevers](https://github.com/ibevers/))
+- fix: fix support for `speechbrain==1.x` ([@Adel-Moumen](https://github.com/Adel-Moumen/))
+
+
+## Version 3.3.0 (2024-06-14)
+
+### TL;DR
+
+`pyannote.audio` does [speech separation](https://hf.co/pyannote/speech-separation-ami-1.0): multi-speaker audio in, one audio channel per speaker out!
+
+```bash
+pip install pyannote.audio[separation]==3.3.0
+```
+
+### New features
+
+- feat(task): add `PixIT` joint speaker diarization and speech separation task (with [@joonaskalda](https://github.com/joonaskalda/))
+- feat(model): add `ToTaToNet` joint speaker diarization and speech separation model (with [@joonaskalda](https://github.com/joonaskalda/))
+- feat(pipeline): add `SpeechSeparation` pipeline (with [@joonaskalda](https://github.com/joonaskalda/))
+- feat(io): add option to select torchaudio `backend`
+
+### Fixes
+
+- fix(task): fix wrong train/development split when training with (some) meta-protocols ([#1709](https://github.com/pyannote/pyannote-audio/issues/1709))
+- fix(task): fix metadata preparation with missing validation subset ([@clement-pages](https://github.com/clement-pages/))
+
+### Improvements
+
+- improve(io): when available, default to using `soundfile` backend
+- improve(pipeline): do not extract embeddings when `max_speakers` is set to 1
+- improve(pipeline): optimize memory usage of most pipelines ([#1713](https://github.com/pyannote/pyannote-audio/pull/1713) by [@benniekiss](https://github.com/benniekiss/))
+
+## Version 3.2.0 (2024-05-08)
+
+### New features
+
 - feat(task): add option to cache task training metadata to speed up training (with [@clement-pages](https://github.com/clement-pages/))
 - feat(model): add `receptive_field`, `num_frames` and `dimension` to models (with [@Bilal-Rahou](https://github.com/Bilal-Rahou))
+- feat(model): add `fbank_only` property to `WeSpeaker` models
 - feat(util): add `Powerset.permutation_mapping` to help with permutation in powerset space (with [@FrenchKrab](https://github.com/FrenchKrab))
-- feat(sample): add sample file at `pyannote.audio.sample.SAMPLE_FILE` 
+- feat(sample): add sample file at `pyannote.audio.sample.SAMPLE_FILE`
 - feat(metric): add `reduce` option to `diarization_error_rate` metric (with [@Bilal-Rahou](https://github.com/Bilal-Rahou))
 - feat(pipeline): add `Waveform` and `SampleRate` preprocessors
 
 ### Fixes
 
-- fix(task): fix random generators and their reproducibility  (with [@FrenchKrab](https://github.com/FrenchKrab))
-- fix(task): fix estimation of training set size  (with [@FrenchKrab](https://github.com/FrenchKrab))
+- fix(task): fix random generators and their reproducibility (with [@FrenchKrab](https://github.com/FrenchKrab))
+- fix(task): fix estimation of training set size (with [@FrenchKrab](https://github.com/FrenchKrab))
+- fix(hook): fix `torch.Tensor` support in `ArtifactHook`
+- fix(doc): fix typo in `Powerset` docstring (with [@lukasstorck](https://github.com/lukasstorck))
+- fix(doc): remove mention of unsupported `numpy.ndarray` waveform (with [@Purfview](https://github.com/Purfview))
 
 ### Improvements
 
@@ -23,10 +86,14 @@
 - improve(io): switch to `torchaudio >= 2.2.0`
 - improve(doc): update tutorials (with [@clement-pages](https://github.com/clement-pages/))
 
-## Breaking changes
+### Breaking changes
 
 - BREAKING(model): get rid of `Model.example_output` in favor of `num_frames` method, `receptive_field` property, and `dimension` property
 - BREAKING(task): custom tasks need to be updated (see "Add your own task" tutorial)
+
+### Community contributions
+
+- community: add tutorial for offline use of `pyannote/speaker-diarization-3.1` (by [@simonottenhauskenbun](https://github.com/simonottenhauskenbun))
 
 ## Version 3.1.1 (2023-12-01)
 
