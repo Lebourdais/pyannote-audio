@@ -77,8 +77,11 @@ def get_model(
         )
 
     elif isinstance(model, Mapping):
+        print(model)
         model.setdefault("use_auth_token", use_auth_token)
-        model = Model.from_pretrained(**model)
+        ckpt = model["checkpoint"]
+        params = model["params"]
+        model = Model.from_pretrained(ckpt, **params)
 
     else:
         raise TypeError(

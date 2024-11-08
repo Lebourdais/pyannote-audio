@@ -198,6 +198,8 @@ class Parameters:
                     },
                 },
             }
+            if "seg_th" in self.optimize_parameters:
+                opti_yml["freeze"]["threshold"] = self.optimize_parameters["seg_th"]
             yaml.dump(opti_yml, opti_out)
 
     def set_augment(

@@ -143,7 +143,7 @@ class ToTaToNet2(Model):
         sep_features=["wavlm", "filter", "diar"],
         merge_lin=False,
         ca_dim=None,
-        output_intermediate_layers = None,
+        output_intermediate_layers=None,
     ):
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
         if ca_dim is not None:
@@ -196,7 +196,7 @@ class ToTaToNet2(Model):
             embedding_dim = ca_dim
         else:
             embedding_dim = 0
-            print("Features for separation branch",self.sep_features)
+            print("Features for separation branch", self.sep_features)
             if "wavlm" in self.sep_features:
                 embedding_dim += 1024
             if "filter" in self.sep_features:
@@ -232,7 +232,7 @@ class ToTaToNet2(Model):
             embedding_dim,
             out_chan=encoder_decoder["n_filters"],
             n_src=n_sources,
-            **self.hparams.dprnn
+            **self.hparams.dprnn,
         )
 
         # # diarization can use a lower resolution than separation
@@ -397,7 +397,7 @@ class ToTaToNet2(Model):
             outputs = F.leaky_relu(linear(outputs))
         out = self.classifier(outputs)
         if self.output_intermediate_layers is not None:
-            torch_save(out,self.output_intermediate_layers,"diar")
+            torch_save(out, self.output_intermediate_layers, "diar")
         out = out.reshape(bsz, self.n_sources, -1)
         return out, outputs
 
@@ -417,7 +417,7 @@ class ToTaToNet2(Model):
         bsz = waveforms.shape[0]
         tf_rep = self.encoder(waveforms)
         if self.output_intermediate_layers is not None:
-            torch_save(tf_rep,self.output_intermediate_layers,"filters")
+            torch_save(tf_rep, self.output_intermediate_layers, "filters")
         # assert not torch.isnan(tf_rep).any(), f"Encoder is NaN : {tf_rep}"
 
         # Extraction of WavLM features
@@ -482,9 +482,9 @@ class ToTaToNet2(Model):
 
         masks = self.masker(merged_rep)
         if self.output_intermediate_layers is not None:
-            torch_save(masks,self.output_intermediate_layers,"masks")
+            torch_save(masks, self.output_intermediate_layers, "masks")
         masked_tf_rep = masks * tf_rep.unsqueeze(1)
-        
+
         decoded_sources = self.decoder(masked_tf_rep)
         # assert not torch.isnan(decoded_sources).any(), "Decoder output is NaN"
         decoded_sources = pad_x_to_y(decoded_sources, waveforms)

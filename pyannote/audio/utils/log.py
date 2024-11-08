@@ -1,6 +1,7 @@
-from rich.console import Console
-import torch
 import os
+
+import torch
+from rich.console import Console
 
 console = Console()
 

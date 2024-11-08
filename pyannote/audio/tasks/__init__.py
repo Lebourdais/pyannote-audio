@@ -24,7 +24,7 @@ from .segmentation.multilabel import MultiLabelSegmentation  # isort:skip
 from .segmentation.speaker_diarization import SpeakerDiarization  # isort:skip
 
 # from .segmentation.PixIT_dup import PixIT  # isort:skip
-from .segmentation.PixIT import PixIT  # isort:skip
+from .separation.PixIT import PixIT  # isort:skip
 from .segmentation.PixIT2 import PixIT2  # isort:skip
 from .segmentation.voice_activity_detection import VoiceActivityDetection  # isort:skip
 from .segmentation.overlapped_speech_detection import (  # isort:skip
