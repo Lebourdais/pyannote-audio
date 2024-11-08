@@ -33,6 +33,7 @@ __all__ = [
     "VoiceActivityDetection",
     "OverlappedSpeechDetection",
     "SpeakerDiarization",
+    "SpeechSeparation",
     "SpeakerDiarizationOptim",
     "Resegmentation",
     "MultiLabelSegmentation",

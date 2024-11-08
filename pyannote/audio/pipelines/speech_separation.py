@@ -45,6 +45,7 @@ from pyannote.audio.pipelines.utils import (
     SpeakerDiarizationMixin,
     get_model,
 )
+from pyannote.audio.pipelines.utils.diarization import set_num_speakers
 from pyannote.audio.utils.signal import binarize
 
 
@@ -493,7 +494,7 @@ class SpeechSeparation(SpeakerDiarizationMixin, Pipeline):
         # setup hook (e.g. for debugging purposes)
         hook = self.setup_hook(file, hook=hook)
 
-        num_speakers, min_speakers, max_speakers = self.set_num_speakers(
+        num_speakers, min_speakers, max_speakers = set_num_speakers(
             num_speakers=num_speakers,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
@@ -686,7 +687,6 @@ class SpeechSeparation(SpeakerDiarizationMixin, Pipeline):
             # the reference, those extra speakers are missing from `mapping`.
             # we add them back here
             mapping = {key: mapping.get(key, key) for key in diarization.labels()}
-
         else:
             # when reference is not available, rename hypothesized speakers
             # to human-readable SPEAKER_00, SPEAKER_01, ...
@@ -700,6 +700,14 @@ class SpeechSeparation(SpeakerDiarizationMixin, Pipeline):
         # at this point, `diarization` speaker labels are strings (or mix of
         # strings and integers when reference is available and some hypothesis
         # speakers are not present in the reference)
+        # re-order sources so that they match
+        # the order given by diarization.labels()
+        inverse_mapping = {label: index for index, label in mapping.items()}
+        original_sw = sources.sliding_window
+        data = sources.data[
+            :, [inverse_mapping[label] for label in diarization.labels()]
+        ]
+        sources = SlidingWindowFeature(data, original_sw)
 
         if not return_embeddings:
             return diarization, sources
@@ -720,7 +728,7 @@ class SpeechSeparation(SpeakerDiarizationMixin, Pipeline):
 
         # re-order centroids so that they match
         # the order given by diarization.labels()
-        inverse_mapping = {label: index for index, label in mapping.items()}
+        # inverse_mapping = {label: index for index, label in mapping.items()}
         centroids = centroids[
             [inverse_mapping[label] for label in diarization.labels()]
         ]

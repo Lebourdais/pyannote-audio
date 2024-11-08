@@ -27,7 +27,7 @@ import itertools
 import math
 import textwrap
 import warnings
-from typing import Callable, Optional, Text, Union
+from typing import Callable, Mapping, Optional, Text, Union
 
 import numpy as np
 import torch
@@ -45,6 +45,7 @@ from pyannote.audio.pipelines.utils import (
     SpeakerDiarizationMixin,
     get_model,
 )
+from pyannote.audio.pipelines.utils.diarization import set_num_speakers
 from pyannote.audio.utils.signal import binarize
 
 
@@ -411,7 +412,7 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         num_chunks, num_frames, local_num_speakers = segmentations.data.shape
 
         num_clusters = np.max(hard_clusters) + 1
-        clustered_segmentations = np.NAN * np.zeros(
+        clustered_segmentations = np.nan * np.zeros(
             (num_chunks, num_frames, num_clusters)
         )
 
@@ -480,15 +481,29 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
         # setup hook (e.g. for debugging purposes)
         hook = self.setup_hook(file, hook=hook)
 
-        num_speakers, min_speakers, max_speakers = self.set_num_speakers(
+        num_speakers, min_speakers, max_speakers = set_num_speakers(
             num_speakers=num_speakers,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
         )
 
+        # when using KMeans clustering (or equivalent), the number of speakers must
+        # be provided alongside the audio file. also, during pipeline training, we
+        # infer the number of speakers from the reference annotation to avoid the
+        # pipeline complaining about missing number of speakers.
+        if self._expects_num_speakers and num_speakers is None:
+            if isinstance(file, Mapping) and "annotation" in file:
+                num_speakers = len(file["annotation"].labels())
+
+            else:
+                raise ValueError(
+                    f"num_speakers must be provided when using {self.klustering} clustering"
+                )
+
         segmentations = self.get_segmentations(file, hook=hook)
         hook("segmentation", segmentations)
         #   shape: (num_chunks, num_frames, local_num_speakers)
+        num_chunks, num_frames, local_num_speakers = segmentations.data.shape
 
         # binarize segmentation
         if self._segmentation.model.specifications.powerset:
@@ -518,29 +533,38 @@ class SpeakerDiarization(SpeakerDiarizationMixin, Pipeline):
 
             return diarization
 
-        if self.klustering == "OracleClustering" and not return_embeddings:
+        # skip speaker embedding extraction and clustering when only one speaker
+        if not return_embeddings and max_speakers < 2:
+            hard_clusters = np.zeros((num_chunks, local_num_speakers), dtype=np.int8)
             embeddings = None
-        else:
-            embeddings = self.get_embeddings(
-                file,
-                binarized_segmentations,
-                exclude_overlap=self.embedding_exclude_overlap,
-                hook=hook,
-            )
-            hook("embeddings", embeddings)
-            #   shape: (num_chunks, local_num_speakers, dimension)
+            centroids = None
 
-        hard_clusters, soft_clusters, centroids = self.clustering(
-            embeddings=embeddings,
-            segmentations=binarized_segmentations,
-            num_clusters=num_speakers,
-            min_clusters=min_speakers,
-            max_clusters=max_speakers,
-            file=file,  # <== for oracle clustering
-            frames=self._segmentation.model.receptive_field,  # <== for oracle clustering
-        )
-        # hard_clusters: (num_chunks, num_speakers)
-        # centroids: (num_speakers, dimension)
+        else:
+            # skip speaker embedding extraction with oracle clustering
+            if self.klustering == "OracleClustering" and not return_embeddings:
+                embeddings = None
+
+            else:
+                embeddings = self.get_embeddings(
+                    file,
+                    binarized_segmentations,
+                    exclude_overlap=self.embedding_exclude_overlap,
+                    hook=hook,
+                )
+                hook("embeddings", embeddings)
+                #   shape: (num_chunks, local_num_speakers, dimension)
+
+            hard_clusters, _, centroids = self.clustering(
+                embeddings=embeddings,
+                segmentations=binarized_segmentations,
+                num_clusters=num_speakers,
+                min_clusters=min_speakers,
+                max_clusters=max_speakers,
+                file=file,  # <== for oracle clustering
+                frames=self._segmentation.model.receptive_field,  # <== for oracle clustering
+            )
+            # hard_clusters: (num_chunks, num_speakers)
+            # centroids: (num_speakers, dimension)
 
         # number of detected clusters is the number of different speakers
         num_different_speakers = np.max(hard_clusters) + 1
