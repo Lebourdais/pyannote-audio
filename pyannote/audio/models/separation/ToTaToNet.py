@@ -56,6 +56,13 @@ try:
 except ImportError:
     TRANSFORMERS_IS_AVAILABLE = False
 
+try:
+    from peft import LoraConfig, LoraModel
+
+    LORA_IS_AVAILABLE = True
+except ImportError:
+    LORA_IS_AVAILABLE = False
+
 
 class ToTaToNet(Model):
     """ToTaToNet joint speaker diarization and speech separation model
@@ -125,6 +132,17 @@ class ToTaToNet(Model):
         "rnn_type": "LSTM",
     }
     DIAR_DEFAULTS = {"frames_per_second": 125}
+    SSL_DEFAULTS = {
+        "type:": "microsoft/wavlm-large",
+        "finetune": "full",  # full, last, average, lora
+        "lora": {
+            "adapter": ["q_proj", "v_proj"],
+            "r": 16,
+            "lora_alpha": 8,
+            "lora_dropout": 0.05,
+            "init_lora_weights": "pissa",
+        },
+    }
 
     def __init__(
         self,
@@ -132,13 +150,20 @@ class ToTaToNet(Model):
         linear: Optional[dict] = None,
         diar: Optional[dict] = None,
         dprnn: dict = None,
+        ssl: dict = None,
         sample_rate: int = 16000,
         num_channels: int = 1,
         task: Optional[Task] = None,
         n_sources: int = 3,
-        use_wavlm: bool = True,
+        use_wavlm: bool = False,  # Deprecated
         gradient_clip_val: float = 5.0,
     ):
+        if use_wavlm:
+            raise DeprecationWarning(
+                "The 'use_wavlm' parameter is deprecated. "
+                "The model now uses the WavLM model by default."
+                "The parameters of the WavLM model can be set in the 'ssl' parameter."
+            )
         if not ASTEROID_IS_AVAILABLE:
             raise ImportError(
                 "'asteroid' must be installed to use ToTaToNet separation. "
@@ -150,16 +175,23 @@ class ToTaToNet(Model):
                 "'transformers' must be installed to use ToTaToNet separation. "
                 "`pip install pyannote-audio[separation]` should do the trick."
             )
+        if not LORA_IS_AVAILABLE and ssl["finetune"] == "lora":
+            raise ImportError(
+                "'peft' must be installed to use ToTaToNet separation with Lora. "
+                "`pip install peft` should do the trick."
+            )
 
         super().__init__(sample_rate=sample_rate, num_channels=num_channels, task=task)
-
+        ssl = merge_dict(self.SSL_DEFAULTS, ssl)
         linear = merge_dict(self.LINEAR_DEFAULTS, linear)
         dprnn = merge_dict(self.DPRNN_DEFAULTS, dprnn)
         encoder_decoder = merge_dict(self.ENCODER_DECODER_DEFAULTS, encoder_decoder)
         diar = merge_dict(self.DIAR_DEFAULTS, diar)
-        self.use_wavlm = use_wavlm
+        self.use_wavlm = "wavlm" in ssl["type"]
         self.save_hyperparameters("encoder_decoder", "linear", "dprnn", "diar")
         self.n_sources = n_sources
+
+        self.finetuning = ssl["finetune"]
 
         if encoder_decoder["fb_name"] == "free":
             n_feats_out = encoder_decoder["n_filters"]
@@ -172,8 +204,9 @@ class ToTaToNet(Model):
         )
 
         if self.use_wavlm:
-            self.wavlm = AutoModel.from_pretrained("microsoft/wavlm-large")
+            self.wavlm = AutoModel.from_pretrained(ssl["type"])
             downsampling_factor = 1
+            model_num_layers = self.wavlm.config.num_hidden_layers
             for conv_layer in self.wavlm.feature_extractor.conv_layers:
                 if isinstance(conv_layer.conv, nn.Conv1d):
                     downsampling_factor *= conv_layer.conv.stride[0]
@@ -201,14 +234,14 @@ class ToTaToNet(Model):
         self.average_pool = nn.AvgPool1d(
             self.diarization_scaling, stride=self.diarization_scaling
         )
-        linaer_input_features = n_feats_out
+        linear_input_features = n_feats_out
         if linear["num_layers"] > 0:
             self.linear = nn.ModuleList(
                 [
                     nn.Linear(in_features, out_features)
                     for in_features, out_features in pairwise(
                         [
-                            linaer_input_features,
+                            linear_input_features,
                         ]
                         + [self.hparams.linear["hidden_size"]]
                         * self.hparams.linear["num_layers"]
@@ -216,7 +249,39 @@ class ToTaToNet(Model):
                 ]
             )
         self.gradient_clip_val = gradient_clip_val
-        self.automatic_optimization = False
+
+        # Finetuning settings
+
+        # If we are entirely finetuning the WavLM model, we need to use two different optimizers
+        self.automatic_optimization = self.finetuning == "full"
+
+        self.use_last = True
+        if self.finetuning == "average":
+            self.use_last = False
+            for param in self.wavlm.parameters():
+                param.requires_grad = False
+            self.weights = nn.Parameter(
+                data=torch.ones(model_num_layers), requires_grad=True
+            )
+        elif self.finetuning == "last":
+            for param in self.wavlm.parameters():
+                param.requires_grad = False
+        elif self.finetuning == "lora":
+
+            adapter = ssl["lora"]["adapter"]
+            r = ssl["lora"]["r"]
+            lora_alpha = ssl["lora"]["lora_alpha"]
+            lora_dropout = ssl["lora"]["lora_dropout"]
+            init_lora_weights = ssl["lora"]["init_lora_weights"]
+            config = LoraConfig(
+                task_type="FEATURE_EXTRACTION",
+                target_modules=adapter,
+                r=r,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                init_lora_weights=init_lora_weights,
+            )
+            self.wavlm = LoraModel(self.wavlm, config, "lora-adapter")
 
     @property
     def dimension(self) -> int:
@@ -320,8 +385,16 @@ class ToTaToNet(Model):
         """
         bsz = waveforms.shape[0]
         tf_rep = self.encoder(waveforms)
+
         if self.use_wavlm:
-            wavlm_rep = self.wavlm(waveforms.squeeze(1)).last_hidden_state
+            if self.finetuning == "average":
+                outputs = self.wavlm(waveforms.squeeze(1)).hidden_states
+                wavlm_rep = torch.stack(outputs[1:], dim=-1) @ F.softmax(
+                    self.weights, dim=0
+                )
+            else:
+                wavlm_rep = self.wavlm(waveforms.squeeze(1)).last_hidden_state
+                # wavlm_rep = torch.stack([wavlm_rep[i] * self.weights[i] for i in range(len(wavlm_rep))], dim=0).sum(dim=0)
             wavlm_rep = wavlm_rep.transpose(1, 2)
             wavlm_rep = wavlm_rep.repeat_interleave(self.wavlm_scaling, dim=-1)
             wavlm_rep = pad_x_to_y(wavlm_rep, tf_rep)
@@ -329,6 +402,7 @@ class ToTaToNet(Model):
             masks = self.masker(wavlm_rep)
         else:
             masks = self.masker(tf_rep)
+
         # shape: (batch, nsrc, nfilters, nframes)
         masked_tf_rep = masks * tf_rep.unsqueeze(1)
         decoded_sources = self.decoder(masked_tf_rep)
